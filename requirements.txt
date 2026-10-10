@@ -1,0 +1,26 @@
+torch>=2.1            # cần >=2.0 cho F.scaled_dot_product_attention
+einops>=0.7           # reshape tensor gọn cho attention, 2.5D
+
+# ---- Đọc/ghi ảnh y tế ----
+SimpleITK>=2.3        # đọc .nii.gz/.mha của SynthRAD, giữ spacing/origin khi ghi sCT
+monai>=1.3            # sliding_window_inference (ghép patch trọng số Gaussian)
+
+# ---- Xử lý số liệu ----
+numpy>=1.24
+scipy>=1.10           # Wilcoxon signed-rank (scipy.stats.wilcoxon)
+statsmodels>=0.14     # hiệu chỉnh Holm (multipletests)
+scikit-image>=0.21    # PSNR, SSIM
+pandas>=2.0           # CSV chỉ số theo bệnh nhân, gộp bảng
+h5py>=3.9             # tùy chọn: gom dữ liệu tiền xử lý thành 1 file
+
+# ---- Config và theo dõi thí nghiệm ----
+pyyaml>=6.0
+omegaconf>=2.3        # config phân tầng base + exp
+wandb>=0.16           # tùy chọn: theo dõi xuyên phiên Colab/Kaggle
+
+# ---- Hình và tiện ích ----
+matplotlib>=3.7       # biểu đồ MAE theo NFE, hình định tính
+tqdm>=4.66
+
+# ---- Kiểm thử ----
+pytest>=7.4
