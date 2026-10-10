@@ -1,0 +1,11 @@
+# Dữ liệu và output: không commit, chỉ giữ .gitkeep
+data/**
+!data/**/
+!data/**/.gitkeep
+outputs/**
+!outputs/**/
+!outputs/**/.gitkeep
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
