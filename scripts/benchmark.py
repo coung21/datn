@@ -30,6 +30,12 @@ def gb(n_bytes: int) -> float:
     return n_bytes / 1024**3
 
 
+def usable_gb(args, device) -> float:
+    """VRAM dùng được: min(budget, VRAM thật), chừa 5% cho desktop/driver."""
+    total = gb(torch.cuda.get_device_properties(device).total_memory)
+    return min(args.budget_gb, total) * 0.95
+
+
 def make_batch(model: UNetModel, batch_size: int, image_size: int, device):
     x = torch.randn(batch_size, 1, image_size, image_size, device=device)
     cond = torch.randn(batch_size, model.in_channels - 1, image_size, image_size, device=device)
@@ -76,7 +82,7 @@ def bench_train(args, batch_size: int, precision: str, checkpoint: bool, device)
 
     peak_alloc = torch.cuda.max_memory_allocated(device)
     peak_reserved = torch.cuda.max_memory_reserved(device)
-    status = "OVER_BUDGET" if gb(peak_reserved) > args.budget_gb else "OK"
+    status = "OVER_BUDGET" if gb(peak_reserved) > usable_gb(args, device) else "OK"
     row.update(
         status=status,
         peak_alloc_gb=round(gb(peak_alloc), 2),
@@ -126,7 +132,7 @@ def main():
     p.add_argument("--image-size", type=int, default=256)
     p.add_argument("--in-channels", type=int, default=4)
     p.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 8, 16, 32])
-    p.add_argument("--precisions", nargs="+", default=["fp32", "fp16", "bf16"], choices=list(DTYPES))
+    p.add_argument("--precisions", nargs="+", default=["fp16", "bf16"], choices=list(DTYPES))
     p.add_argument("--checkpoint", choices=["off", "on", "both"], default="both")
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--steps", type=int, default=20)
@@ -149,7 +155,8 @@ def main():
     props = torch.cuda.get_device_properties(device)
     # Trên Windows (WDDM) driver tràn sang RAM hệ thống thay vì báo OOM, chạy cực chậm.
     # Giới hạn allocator theo VRAM thật để cấu hình quá lớn báo OOM ngay.
-    torch.cuda.set_per_process_memory_fraction(min(args.budget_gb * 1024**3 / props.total_memory, 1.0), device)
+    # (không chặn được hoàn toàn, nên còn kiểm tra thêm SPILL theo throughput ở dưới)
+    torch.cuda.set_per_process_memory_fraction(usable_gb(args, device) * 1024**3 / props.total_memory, device)
     print(f"GPU: {props.name}, {gb(props.total_memory):.1f} GB, torch {torch.__version__}")
     print(f"Patch {args.image_size}x{args.image_size}, in_channels={args.in_channels}, "
           f"warmup={args.warmup}, steps={args.steps}\n")
@@ -160,13 +167,20 @@ def main():
     print(header)
     print("-" * len(header))
     oom = set()
+    prev_throughput = {}
     for prec, ckpt, bs in itertools.product(args.precisions, ckpts, args.batch_sizes):
-        if (prec, ckpt) in oom:  # batch nhỏ hơn đã OOM thì batch lớn hơn chắc chắn OOM
+        key = (prec, ckpt)
+        if key in oom:  # batch nhỏ hơn đã OOM/tràn thì batch lớn hơn cũng vậy
             r = dict(batch_size=bs, precision=prec, checkpoint=ckpt, status="SKIP")
         else:
             r = bench_train(args, bs, prec, ckpt, device)
-            if r["status"] in ("OOM", "OVER_BUDGET"):
-                oom.add((prec, ckpt))
+            # tăng batch mà throughput giảm mạnh -> driver đang tràn VRAM sang RAM hệ thống
+            if r["status"] == "OK" and r["samples_per_sec"] < 0.6 * prev_throughput.get(key, 0):
+                r["status"] = "SPILL"
+            if r["status"] != "OK":
+                oom.add(key)
+            else:
+                prev_throughput[key] = r["samples_per_sec"]
         rows.append(r)
         print(f"{bs:>4} {prec:>5} {str(ckpt):>5} {r['status']:>11} {r.get('peak_alloc_gb', '-'):>9} "
               f"{r.get('peak_reserved_gb', '-'):>8} {r.get('sec_per_iter', '-'):>8} {r.get('samples_per_sec', '-'):>7}")
