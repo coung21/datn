@@ -74,16 +74,9 @@ def bench_train(args, batch_size: int, precision: str, checkpoint: bool, device)
         del model, opt
         torch.cuda.empty_cache()
 
-    total = torch.cuda.get_device_properties(device).total_memory
     peak_alloc = torch.cuda.max_memory_allocated(device)
     peak_reserved = torch.cuda.max_memory_reserved(device)
-    # Trên Windows (WDDM) driver có thể tràn sang RAM hệ thống thay vì báo OOM -> rất chậm
-    if peak_reserved > total:
-        status = "SPILL"
-    elif gb(peak_reserved) > args.budget_gb:
-        status = "OVER_BUDGET"
-    else:
-        status = "OK"
+    status = "OVER_BUDGET" if gb(peak_reserved) > args.budget_gb else "OK"
     row.update(
         status=status,
         peak_alloc_gb=round(gb(peak_alloc), 2),
@@ -149,10 +142,14 @@ def main():
 
     if not torch.cuda.is_available():
         sys.exit("Cần CUDA để benchmark.")
+    sys.stdout.reconfigure(line_buffering=True)
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
     props = torch.cuda.get_device_properties(device)
+    # Trên Windows (WDDM) driver tràn sang RAM hệ thống thay vì báo OOM, chạy cực chậm.
+    # Giới hạn allocator theo VRAM thật để cấu hình quá lớn báo OOM ngay.
+    torch.cuda.set_per_process_memory_fraction(min(args.budget_gb * 1024**3 / props.total_memory, 1.0), device)
     print(f"GPU: {props.name}, {gb(props.total_memory):.1f} GB, torch {torch.__version__}")
     print(f"Patch {args.image_size}x{args.image_size}, in_channels={args.in_channels}, "
           f"warmup={args.warmup}, steps={args.steps}\n")
@@ -162,8 +159,14 @@ def main():
     header = f"{'bs':>4} {'prec':>5} {'ckpt':>5} {'status':>11} {'alloc GB':>9} {'resv GB':>8} {'s/iter':>8} {'img/s':>7}"
     print(header)
     print("-" * len(header))
+    oom = set()
     for prec, ckpt, bs in itertools.product(args.precisions, ckpts, args.batch_sizes):
-        r = bench_train(args, bs, prec, ckpt, device)
+        if (prec, ckpt) in oom:  # batch nhỏ hơn đã OOM thì batch lớn hơn chắc chắn OOM
+            r = dict(batch_size=bs, precision=prec, checkpoint=ckpt, status="SKIP")
+        else:
+            r = bench_train(args, bs, prec, ckpt, device)
+            if r["status"] in ("OOM", "OVER_BUDGET"):
+                oom.add((prec, ckpt))
         rows.append(r)
         print(f"{bs:>4} {prec:>5} {str(ckpt):>5} {r['status']:>11} {r.get('peak_alloc_gb', '-'):>9} "
               f"{r.get('peak_reserved_gb', '-'):>8} {r.get('sec_per_iter', '-'):>8} {r.get('samples_per_sec', '-'):>7}")
