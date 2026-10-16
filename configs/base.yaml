@@ -83,7 +83,7 @@ logging:
   tqdm: true
   wandb:
     enabled: true
-    project: datn-mri2ct
+    project: mri2ct
     entity: null                    # null = tài khoản mặc định sau `wandb login`
     mode: online                    # online | offline (sync sau bằng `wandb sync`) | disabled
     tags: []
