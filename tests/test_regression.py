@@ -164,6 +164,44 @@ def test_wandb_disabled_is_noop(tmp_path):
     assert wb.run is None and not (tmp_path / "wandb_id.txt").exists()
 
 
+def test_wandb_enabled_with_fake_module(tmp_path, monkeypatch):
+    """Chỉ dùng wandb.init / Image / Table: không phụ thuộc API nội bộ (vd wandb.util) đổi theo phiên bản."""
+    calls = {}
+
+    class FakeRun:
+        id = None
+        summary = {}
+
+        def log(self, data, step=None):
+            calls.setdefault("log", []).append((data, step))
+
+        def finish(self):
+            calls["finish"] = True
+
+    def fake_init(**kw):
+        calls["init"] = kw
+        run = FakeRun()
+        run.id = kw["id"]
+        return run
+
+    fake = type(sys)("wandb")
+    fake.init, fake.Image, fake.Table = fake_init, lambda arr, caption=None: arr, lambda dataframe: dataframe
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+
+    run_dir = tmp_path / "regression_20261016-230229"
+    run_dir.mkdir()
+    cfg = {"run_name": "regression", "logging": {"wandb": {"enabled": True, "project": "mri2ct", "entity": "e"}}}
+    wb = WandbLogger(cfg, run_dir, resume=False)
+    assert calls["init"]["name"] == run_dir.name and calls["init"]["group"] == "regression"
+    run_id = (run_dir / "wandb_id.txt").read_text()
+    assert re.fullmatch(r"[0-9a-f]{8}", run_id)
+    wb.log({"train/loss": 1.0}, step=3)
+    wb.finish()
+    assert calls["log"] == [({"train/loss": 1.0}, 3)] and calls["finish"]
+    WandbLogger(cfg, run_dir, resume=True)
+    assert calls["init"]["id"] == run_id  # resume giữ nguyên id
+
+
 def test_summarize_special():
     df = pd.DataFrame({"id": ["a", "b", "c"], "region": ["brain", "brain", "pelvis"], "special": [False, True, False],
                        "nfe": [1, 1, 1], "mae": [10.0, 30.0, 50.0], "psnr": [30.0] * 3, "ssim": [0.9] * 3})

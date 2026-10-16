@@ -1,5 +1,6 @@
 """Log lên Weights & Biases (tắt được qua config logging.wandb.enabled)."""
 
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -33,7 +34,8 @@ class WandbLogger:
 
         self._wandb = wandb
         id_file = run_dir / "wandb_id.txt"
-        run_id = id_file.read_text().strip() if resume and id_file.exists() else wandb.util.generate_id()
+        # tự sinh id: wandb.util.generate_id đã bị bỏ ở wandb >= 0.30
+        run_id = id_file.read_text().strip() if resume and id_file.exists() else uuid.uuid4().hex[:8]
         id_file.write_text(run_id)
         self.run = wandb.init(
             project=wc["project"], entity=wc.get("entity"), name=run_dir.name, group=cfg.get("run_name"),
