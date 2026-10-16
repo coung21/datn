@@ -1,7 +1,7 @@
 """Đánh giá: val nhanh (lát cố định) trong lúc train, và val/test toàn volume.
 
-    python -X utf8 -m src.eval.evaluate --run outputs/runs/regression --ckpt best --split test
-    python -X utf8 -m src.eval.evaluate --run outputs/runs/regression --ckpt best --split test --save-nii
+    python -X utf8 -m src.eval.evaluate --run outputs/runs/regression_20261016-231500 --ckpt best --split test
+    python -X utf8 -m src.eval.evaluate --run outputs/runs/regression_20261016-231500 --ckpt best --split test --save-nii
 """
 
 import argparse
@@ -103,7 +103,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--run", required=True, help="thư mục run, vd outputs/runs/regression")
+    p.add_argument("--run", required=True, help="thư mục run, vd outputs/runs/regression_20261016-231500")
     p.add_argument("--ckpt", default="best", help="best | last | đường dẫn .pt")
     p.add_argument("--split", default="test", choices=["val", "test"])
     p.add_argument("--nfe", type=int, nargs="+", default=None, help="mặc định: inference.nfe trong config")

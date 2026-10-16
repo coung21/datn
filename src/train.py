@@ -1,10 +1,10 @@
 """Train 1 phương pháp MR -> CT theo config.
 
     python -X utf8 -m src.train --exp configs/exp/regression.yaml
-    python -X utf8 -m src.train --exp configs/exp/regression.yaml --resume
+    python -X utf8 -m src.train --resume outputs/runs/regression_20261016-231500
     python -X utf8 -m src.train --exp ... --set train.total_images=4000 data.num_workers=0
 
-Đầu ra trong <output_dir>/runs/<run_name>/:
+Đầu ra trong <output_dir>/runs/<run_name>_<YYYYmmdd-HHMMSS>/:
     config.yaml, train_log.csv, val_log.csv,
     checkpoints/step_XXXXXX.pt (chỉ trọng số), last.pt (để train tiếp), best.pt,
     val_full.csv (val toàn volume cho top-k checkpoint theo val nhanh),
@@ -78,15 +78,23 @@ def main():
     p.add_argument("--config", default="configs/base.yaml")
     p.add_argument("--exp", default=None)
     p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="ghi đè config")
-    p.add_argument("--resume", action="store_true", help="train tiếp từ last.pt của run")
+    p.add_argument("--resume", default=None, metavar="RUN_DIR",
+                   help="train tiếp từ last.pt của run này (config đọc từ RUN_DIR/config.yaml, --set vẫn áp dụng)")
     args = p.parse_args()
 
-    cfg = load_config(args.config, args.exp, args.set)
+    if args.resume:
+        run_dir = Path(args.resume)
+        if not (run_dir / "config.yaml").exists():
+            raise SystemExit(f"{run_dir} không phải thư mục run (thiếu config.yaml)")
+        cfg = load_config(run_dir / "config.yaml", None, args.set)
+    else:
+        cfg = load_config(args.config, args.exp, args.set)
+        cfg.setdefault("run_name", Path(args.exp or "base").stem)
+        run_dir = Path(cfg["output_dir"]) / "runs" / f"{cfg['run_name']}_{time.strftime('%Y%m%d-%H%M%S')}"
+        if run_dir.exists():
+            raise SystemExit(f"{run_dir} đã tồn tại")
     tc, dc = cfg["train"], cfg["data"]
-    run_name = cfg.get("run_name", Path(args.exp or "base").stem)
-    run_dir = Path(cfg["output_dir"]) / "runs" / run_name
-    if run_dir.exists() and not args.resume:
-        raise SystemExit(f"{run_dir} đã tồn tại: dùng --resume hoặc đổi run_name")
+    print(f"Run: {run_dir}", flush=True)
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     (run_dir / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True))
 
@@ -122,7 +130,9 @@ def main():
     )
 
     step = 0
-    if args.resume and (run_dir / "last.pt").exists():
+    if args.resume:
+        if not (run_dir / "last.pt").exists():
+            raise SystemExit(f"{run_dir} chưa có last.pt để train tiếp")
         ckpt = torch.load(run_dir / "last.pt", map_location="cpu", weights_only=True)
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
@@ -132,10 +142,10 @@ def main():
 
     print(f"{len(train_ds)} lát train, {len(val_ds)} lát val | {total_steps} optimizer step x {images_per_step} ảnh", flush=True)
     train_log, val_log = CsvLogger(run_dir / "train_log.csv"), CsvLogger(run_dir / "val_log.csv")
-    wb = WandbLogger(cfg, run_name, run_dir, args.resume)
+    wb = WandbLogger(cfg, run_dir, resume=bool(args.resume))
     progress = cfg.get("logging", {}).get("tqdm", True)
     # stdout bị chuyển ra file (chạy nền qua ssh) -> cập nhật thưa để log không bị ngập dòng
-    bar = tqdm(total=total_steps, initial=step, desc=run_name, dynamic_ncols=True, disable=not progress,
+    bar = tqdm(total=total_steps, initial=step, desc=run_dir.name, dynamic_ncols=True, disable=not progress,
                mininterval=0.5 if sys.stderr.isatty() else 60)
     data = infinite(loader)
     start, window_start, window_loss, window_steps = time.perf_counter(), time.perf_counter(), 0.0, 0

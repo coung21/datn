@@ -22,7 +22,9 @@ def example_panel(mr: np.ndarray, sct: np.ndarray, ct: np.ndarray, mask: np.ndar
 
 
 class WandbLogger:
-    def __init__(self, cfg: dict, run_name: str, run_dir: Path, resume: bool):
+    """Tên run = tên thư mục run (<run_name>_<thời gian>); các lần chạy cùng run_name gom chung 1 group."""
+
+    def __init__(self, cfg: dict, run_dir: Path, resume: bool):
         wc = cfg.get("logging", {}).get("wandb", {})
         self.run = None
         if not wc.get("enabled", False) or wc.get("mode") == "disabled":
@@ -34,7 +36,8 @@ class WandbLogger:
         run_id = id_file.read_text().strip() if resume and id_file.exists() else wandb.util.generate_id()
         id_file.write_text(run_id)
         self.run = wandb.init(
-            project=wc["project"], entity=wc.get("entity"), name=run_name, id=run_id, resume="allow",
+            project=wc["project"], entity=wc.get("entity"), name=run_dir.name, group=cfg.get("run_name"),
+            id=run_id, resume="allow",
             config=cfg, dir=str(run_dir), mode=wc.get("mode", "online"), tags=wc.get("tags") or None,
         )
 

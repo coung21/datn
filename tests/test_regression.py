@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import sys
 
 import numpy as np
@@ -95,17 +96,29 @@ def tiny_run(tmp_path, monkeypatch):
         "logging.wandb.enabled=false",
     ]
 
-    def run(*extra, resume=False):
-        argv = ["train", "--exp", "configs/exp/regression.yaml", "--set", *overrides, *extra]
-        monkeypatch.setattr(sys, "argv", argv + (["--resume"] if resume else []))
-        train_main()
+    runs = tmp_path / "runs"
 
-    return tmp_path / "runs" / "regression", run
+    def run(*extra, resume=None):
+        """Train mới (trả về thư mục run vừa tạo) hoặc train tiếp run `resume`."""
+        before = set(runs.glob("*")) if runs.exists() else set()
+        if resume:
+            argv = ["train", "--resume", str(resume), "--set", *extra]
+        else:
+            argv = ["train", "--exp", "configs/exp/regression.yaml", "--set", *overrides, *extra]
+        monkeypatch.setattr(sys, "argv", argv)
+        train_main()
+        if resume:
+            return resume
+        (new,) = set(runs.glob("*")) - before
+        return new
+
+    return runs, run
 
 
 def test_train_end_to_end(tiny_run, monkeypatch, capsys):
-    run_dir, run = tiny_run
-    run()  # 24 ảnh / (2 x 2) = 6 optimizer step
+    runs, run = tiny_run
+    run_dir = run()  # 24 ảnh / (2 x 2) = 6 optimizer step
+    assert re.fullmatch(r"regression_\d{8}-\d{6}", run_dir.name)
     log = pd.read_csv(run_dir / "train_log.csv")
     assert log["step"].tolist() == [2, 4, 6] and log["loss"].notna().all()
     assert pd.read_csv(run_dir / "val_log.csv")["step"].tolist() == [3, 6]
@@ -114,10 +127,10 @@ def test_train_end_to_end(tiny_run, monkeypatch, capsys):
     assert set(vf["step"]) == {3, 6} and len(vf) == 4 and (vf["mae"] > 0).all()
     assert (run_dir / "best.pt").exists() and (run_dir / "last.pt").exists()
 
-    with pytest.raises(SystemExit):  # không ghi đè run cũ
-        run()
-    run("train.total_images=32", resume=True)  # train tiếp 6 -> 8
+    run("train.total_images=32", resume=run_dir)  # train tiếp 6 -> 8, config đọc từ run
     assert pd.read_csv(run_dir / "train_log.csv")["step"].tolist() == [2, 4, 6, 8]
+    with pytest.raises(SystemExit):  # thư mục không phải run
+        run(resume=runs / "khong_ton_tai")
 
     monkeypatch.setattr(sys, "argv", ["evaluate", "--run", str(run_dir), "--ckpt", "best", "--split", "test"])
     evaluate.main()
@@ -129,8 +142,8 @@ def test_train_end_to_end(tiny_run, monkeypatch, capsys):
 
 
 def test_val_fast_examples(tiny_run):
-    run_dir, run = tiny_run
-    run()
+    _, run = tiny_run
+    run_dir = run()
     model, method, cfg, _ = evaluate.load_checkpoint(run_dir / "best.pt", torch.device("cpu"))
     val_ds = evaluate.build_dataset(cfg, ["1BB001", "1PC001"], "val")
     res, examples = evaluate.val_fast(method, model, val_ds, [1, 4], cfg["inference"], torch.device("cpu"))
@@ -143,7 +156,7 @@ def test_val_fast_examples(tiny_run):
 
 
 def test_wandb_disabled_is_noop(tmp_path):
-    wb = WandbLogger({"logging": {"wandb": {"enabled": False}}}, "x", tmp_path, resume=False)
+    wb = WandbLogger({"logging": {"wandb": {"enabled": False}}}, tmp_path, resume=False)
     wb.log({"a": 1}, step=1)
     wb.log_examples("k", [{"id": "1BA001"}], step=1)
     wb.summary({"a": 1})
