@@ -1,0 +1,86 @@
+# Cấu hình gốc. Các file trong configs/exp/ chỉ ghi đè phần khác biệt.
+# Số liệu VRAM/tốc độ: scripts/benchmark.py trên RTX 5060 Ti 16GB (outputs/benchmark/).
+# Số liệu dữ liệu: SynthRAD2023 Task1 train (outputs/dataset_meta/).
+
+seed: 42
+output_dir: outputs
+
+data:
+  raw_root: data/raw/Task1_train
+  processed_dir: data/processed
+  regions: [brain, pelvis]          # chung 1 model
+  split:
+    file: configs/splits/split_seed42.json
+    ratios: {train: 0.7, val: 0.1, test: 0.2}   # 252 / 36 / 72 bệnh nhân
+    stratify_by: [region, center]
+    seed: 42
+  preprocess:
+    bbox_margin: [2, 8, 8]          # lề (z, y, x) khi cắt theo bbox của mask
+    workers: 8
+  context_slices: 1                 # 2.5D: lát z +- 1 -> 3 kênh MR
+  context_mm: 2.0                   # stride = round(2.0 / spacing_z): brain 2, pelvis 1
+  patch_size: 256
+  min_foreground: 0.1               # bỏ patch có < 10% điểm trong mask
+  ct_clip: [-1024, 3000]            # HU -> [-1, 1]
+  mr_percentiles: [0.5, 99.5]       # tính trong mask, theo từng volume -> [-1, 1]
+  pad_value: -1.0                   # MR/CT sau chuẩn hóa; mask pad 0
+  hflip: 0.5
+  val_slices_per_patient: 5
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+
+model:                              # 33.40M tham số
+  image_size: 256
+  in_channels: 4                    # 1 (x_t) + 2*context_slices+1 (MR)
+  out_channels: 1
+  model_channels: 64
+  channel_mult: [1, 2, 2, 4, 4]
+  num_res_blocks: 2
+  attention_resolutions: [32, 16]
+  num_head_channels: 64
+  dropout: 0.1
+  use_scale_shift_norm: true
+  resblock_updown: true
+  time_scale: 1000.0
+  use_checkpoint: false
+
+train:
+  precision: bf16
+  batch_size: 8                     # ~12.8GB / 16GB, batch 12 OOM
+  grad_accum: 4                     # batch hiệu dụng 32
+  total_images: 400000              # -> 12500 optimizer step, ~10 epoch, ~7h compute
+  optimizer:
+    name: adamw
+    lr: 2.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+  lr_schedule:
+    name: cosine
+    warmup_steps: 250               # optimizer step
+    min_lr: 1.0e-6
+  grad_clip: 1.0
+  ema: null                         # không dùng EMA
+  cudnn_benchmark: true
+  log_every: 25                     # optimizer step
+  val_every: 1250
+  save_every: 1250
+  val_fast_nfe: [1, 4]
+  val_full:
+    top_k: 2                        # chạy val toàn volume cho 2 checkpoint tốt nhất
+    nfe: 4
+
+inference:
+  precision: bf16
+  roi_size: 256
+  overlap: 0.25
+  blend_mode: gaussian
+  pad_value: -1.0
+  sw_batch_size: 16
+  nfe: [1, 2, 4, 10, 50]
+
+eval:
+  metrics: [mae, psnr, ssim]
+  in_mask: true
+  hu_range: [-1024, 3000]
+  report_without_special: true      # báo cáo thêm khi bỏ các ca có ghi chú
