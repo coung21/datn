@@ -143,7 +143,7 @@ def main():
     if not torch.cuda.is_available():
         sys.exit("Cần CUDA để benchmark.")
     sys.stdout.reconfigure(line_buffering=True)
-    device = torch.device("cuda")
+    device = torch.device("cuda", torch.cuda.current_device())
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
     props = torch.cuda.get_device_properties(device)
