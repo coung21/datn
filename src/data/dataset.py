@@ -66,6 +66,18 @@ def load_split(path) -> dict:
     return json.loads(Path(path).read_text())
 
 
+def build_dataset(cfg: dict, ids: list[str], mode: str) -> "SliceDataset":
+    """Tạo SliceDataset từ phần data của config."""
+    d = cfg["data"]
+    return SliceDataset(
+        d["processed_dir"], ids, mode=mode,
+        patch_size=d["patch_size"], context_slices=d["context_slices"], context_mm=d["context_mm"],
+        min_foreground=d["min_foreground"], hflip=d["hflip"], ct_clip=d["ct_clip"],
+        mr_percentiles=d["mr_percentiles"], pad_value=d["pad_value"],
+        val_slices_per_patient=d["val_slices_per_patient"],
+    )
+
+
 class SliceDataset(Dataset):
     def __init__(
         self,
@@ -121,6 +133,11 @@ class SliceDataset(Dataset):
             d = self._dir(pid)
             self._cache[pid] = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in ("ct", "mr", "mask")}
         return self._cache[pid]
+
+    def load_volume(self, pid: str) -> tuple[np.ndarray, np.ndarray]:
+        """CT (HU, float32) và mask của cả volume (sau bbox) - làm ground truth khi đánh giá."""
+        arr = self._arrays(pid)
+        return np.asarray(arr["ct"], dtype=np.float32), np.asarray(arr["mask"])
 
     def load_slice(self, pid: str, z: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Lát z nguyên kích thước (sau bbox), đã chuẩn hóa: mr [C,H,W], ct [1,H,W], mask [1,H,W]."""

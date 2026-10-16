@@ -14,20 +14,9 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data.dataset import SliceDataset, load_split  # noqa: E402
+from src.data.dataset import build_dataset, load_split  # noqa: E402
 
 GPU_IMG_PER_SEC = 16.1  # bf16, batch 8, outputs/benchmark/bf16_nockpt.csv
-
-
-def build_train_dataset(cfg: dict) -> SliceDataset:
-    d = cfg["data"]
-    split = load_split(d["split"]["file"])
-    return SliceDataset(
-        d["processed_dir"], split["train"], mode="train",
-        patch_size=d["patch_size"], context_slices=d["context_slices"], context_mm=d["context_mm"],
-        min_foreground=d["min_foreground"], hflip=d["hflip"], ct_clip=d["ct_clip"],
-        mr_percentiles=d["mr_percentiles"], pad_value=d["pad_value"],
-    )
 
 
 def main():
@@ -39,7 +28,7 @@ def main():
     args = p.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
-    ds = build_train_dataset(cfg)
+    ds = build_dataset(cfg, load_split(cfg["data"]["split"]["file"])["train"], "train")
     bs = cfg["train"]["batch_size"]
     print(f"{len(ds)} lát train, batch {bs}, patch {cfg['data']['patch_size']}", flush=True)
 

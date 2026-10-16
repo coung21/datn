@@ -1,0 +1,6 @@
+# Baseline UNet hồi quy trực tiếp MR -> CT. Các tham số khác giữ nguyên base.yaml.
+run_name: regression
+method:
+  name: regression
+model:
+  in_channels: 3   # chỉ 3 lát MR, không có x_t
