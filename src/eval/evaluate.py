@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from ..data.dataset import SliceDataset, build_dataset, load_split
 from ..data.preprocess import parse_id
@@ -31,32 +32,49 @@ def load_checkpoint(path, device) -> tuple[torch.nn.Module, Method, dict, dict]:
     return model.to(device).eval(), build_method(cfg["method"]["name"]), cfg, ckpt
 
 
-def val_fast(method: Method, model, val_ds: SliceDataset, nfe_list, inf_cfg, device) -> dict[str, float]:
-    """MAE (HU, trong mask) trên các lát val cố định, trung bình theo bệnh nhân."""
+def val_fast(
+    method: Method, model, val_ds: SliceDataset, nfe_list, inf_cfg, device, progress: bool = True
+) -> tuple[dict[str, float], list[dict]]:
+    """MAE (HU, trong mask) trên các lát val cố định, trung bình theo bệnh nhân.
+
+    Trả thêm ảnh mẫu (NFE lớn nhất): lát giữa của bệnh nhân val đầu tiên mỗi region.
+    """
     by_pid = defaultdict(list)
     for pid, z in val_ds.index:
         by_pid[pid].append(z)
+    example_pids = {}
+    for pid in by_pid:
+        example_pids.setdefault(parse_id(pid)["region"], pid)
+
     model.eval()
-    res = {}
-    for nfe in method.nfe_values(list(nfe_list)):
+    res, examples = {}, []
+    nfes = method.nfe_values(list(nfe_list))
+    for nfe in nfes:
         maes = []
-        for pid, zs in by_pid.items():
+        for pid, zs in tqdm(by_pid.items(), desc=f"val nfe={nfe}", leave=False, disable=not progress):
             sct = predict_volume(method, model, val_ds, pid, nfe, inf_cfg, device, slices=zs)
             ct, mask = val_ds.load_volume(pid)
             maes.append(mae(sct, ct[zs], mask[zs]))
+            if nfe == nfes[-1] and pid in example_pids.values():
+                i = len(zs) // 2
+                mr = val_ds.load_slice(pid, zs[i])[0]
+                examples.append({"id": pid, "z": zs[i], "mr": mr[len(mr) // 2], "sct": sct[i],
+                                 "ct": ct[zs[i]], "mask": mask[zs[i]]})
         res[f"mae_nfe{nfe}"] = float(np.mean(maes))
-    return res
+    return res, examples
 
 
 def evaluate_volumes(
-    method: Method, model, cfg: dict, ids, nfe_list, device, special=None, nii_dir: Path | None = None
+    method: Method, model, cfg: dict, ids, nfe_list, device, special=None, nii_dir: Path | None = None,
+    progress: bool = True,
 ) -> pd.DataFrame:
     """Metric toàn volume cho từng bệnh nhân x NFE."""
     ds = build_dataset(cfg, list(ids), "val")
     special = special or {}
     rows = []
     for nfe in method.nfe_values(list(nfe_list)):
-        for pid in ids:
+        bar = tqdm(ids, desc=f"eval nfe={nfe}", disable=not progress)
+        for pid in bar:
             start = time.perf_counter()
             sct = predict_volume(method, model, ds, pid, nfe, cfg["inference"], device)
             seconds = time.perf_counter() - start
@@ -67,7 +85,7 @@ def evaluate_volumes(
             })
             if nii_dir is not None:
                 save_nifti(sct, ds.metas[pid], nii_dir / f"nfe{nfe}" / f"{pid}.nii.gz")
-            print(f"  nfe={nfe} {pid}: MAE {rows[-1]['mae']:.1f} HU", flush=True)
+            bar.set_postfix(id=pid, mae=f"{rows[-1]['mae']:.1f}")
     return pd.DataFrame(rows)
 
 

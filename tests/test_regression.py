@@ -15,6 +15,7 @@ from src.models import UNetModel
 from src.train import cosine_with_warmup
 from src.train import main as train_main
 from src.utils.config import apply_overrides, deep_merge, load_config
+from src.utils.logger import WandbLogger, example_panel
 
 TINY_MODEL = dict(image_size=32, in_channels=3, model_channels=32, channel_mult=(1, 2), num_res_blocks=1,
                   attention_resolutions=(16,), num_head_channels=32)
@@ -91,6 +92,7 @@ def tiny_run(tmp_path, monkeypatch):
         "train.batch_size=2", "train.grad_accum=2", "train.total_images=24", "train.log_every=2",
         "train.val_every=3", "train.save_every=3", "train.lr_schedule.warmup_steps=2", "train.precision=fp32",
         "train.cudnn_benchmark=false", "inference.precision=fp32", "inference.roi_size=32", "inference.sw_batch_size=4",
+        "logging.wandb.enabled=false",
     ]
 
     def run(*extra, resume=False):
@@ -124,6 +126,29 @@ def test_train_end_to_end(tiny_run, monkeypatch, capsys):
     assert per["id"].tolist() == ["1BC001"] and per["nfe"].tolist() == [1]
     summary = pd.read_csv(out / "summary.csv")
     assert set(summary["subset"]) == {"all", "no_special"}
+
+
+def test_val_fast_examples(tiny_run):
+    run_dir, run = tiny_run
+    run()
+    model, method, cfg, _ = evaluate.load_checkpoint(run_dir / "best.pt", torch.device("cpu"))
+    val_ds = evaluate.build_dataset(cfg, ["1BB001", "1PC001"], "val")
+    res, examples = evaluate.val_fast(method, model, val_ds, [1, 4], cfg["inference"], torch.device("cpu"))
+    assert list(res) == ["mae_nfe1"]
+    assert [e["id"] for e in examples] == ["1BB001", "1PC001"]  # 1 lát mỗi region
+    e = examples[0]
+    assert e["mr"].shape == e["sct"].shape == e["ct"].shape == e["mask"].shape
+    panel = example_panel(e["mr"], e["sct"], e["ct"], e["mask"])
+    assert panel.dtype == np.uint8 and panel.shape == (e["mr"].shape[0], 4 * e["mr"].shape[1])
+
+
+def test_wandb_disabled_is_noop(tmp_path):
+    wb = WandbLogger({"logging": {"wandb": {"enabled": False}}}, "x", tmp_path, resume=False)
+    wb.log({"a": 1}, step=1)
+    wb.log_examples("k", [{"id": "1BA001"}], step=1)
+    wb.summary({"a": 1})
+    wb.finish()
+    assert wb.run is None and not (tmp_path / "wandb_id.txt").exists()
 
 
 def test_summarize_special():
