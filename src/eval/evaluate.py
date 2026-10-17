@@ -2,6 +2,9 @@
 
     python -X utf8 -m src.eval.evaluate --run outputs/runs/regression_20261016-231500 --ckpt best --split test
     python -X utf8 -m src.eval.evaluate --run outputs/runs/regression_20261016-231500 --ckpt best --split test --save-nii
+
+Kết quả: <run>/eval/<split>_<ckpt>/{per_patient,summary}.csv, đồng thời ghi tiếp vào run wandb
+của lần train (bảng eval/<split>_<ckpt>/... và summary <split>_<ckpt>/nfe<n>/<region>/<metric>).
 """
 
 import argparse
@@ -19,6 +22,7 @@ from ..data.preprocess import parse_id
 from ..inference.predict import predict_volume, save_nifti
 from ..methods import Method, build_method
 from ..models import UNetModel
+from ..utils.logger import WandbLogger
 from .metrics import all_metrics, mae
 
 METRICS = ["mae", "psnr", "ssim"]
@@ -58,7 +62,8 @@ def val_fast(
             if nfe == nfes[-1] and pid in example_pids.values():
                 i = len(zs) // 2
                 mr = val_ds.load_slice(pid, zs[i])[0]
-                examples.append({"id": pid, "z": zs[i], "mr": mr[len(mr) // 2], "sct": sct[i],
+                examples.append({"id": pid, "region": parse_id(pid)["region"], "z": zs[i],
+                                 "mr": mr[len(mr) // 2], "sct": sct[i],
                                  "ct": ct[zs[i]], "mask": mask[zs[i]]})
         res[f"mae_nfe{nfe}"] = float(np.mean(maes))
     return res, examples
@@ -101,6 +106,16 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(parts).sort_values(["subset", "nfe", "region"]).reset_index(drop=True)
 
 
+def summary_metrics(summary: pd.DataFrame, tag: str) -> dict[str, float]:
+    """Bảng summary -> các giá trị phẳng cho wandb summary, vd test_best/nfe1/brain/mae."""
+    out = {}
+    for _, r in summary.iterrows():
+        prefix = tag if r["subset"] == "all" else f"{tag}_no_special"
+        for m in METRICS:
+            out[f"{prefix}/nfe{int(r['nfe'])}/{r['region']}/{m}"] = float(r[f"{m}_mean"])
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", required=True, help="thư mục run, vd outputs/runs/regression_20261016-231500")
@@ -108,6 +123,7 @@ def main():
     p.add_argument("--split", default="test", choices=["val", "test"])
     p.add_argument("--nfe", type=int, nargs="+", default=None, help="mặc định: inference.nfe trong config")
     p.add_argument("--save-nii", action="store_true")
+    p.add_argument("--no-wandb", action="store_true", help="không ghi kết quả vào run wandb của lần train")
     args = p.parse_args()
 
     run = Path(args.run)
@@ -128,6 +144,15 @@ def main():
     summary.to_csv(out / "summary.csv", index=False)
     print(summary.round(3).to_string(index=False))
     print(f"Đã lưu {out}")
+
+    if not args.no_wandb:
+        # ghi tiếp vào run wandb của lần train (id trong wandb_id.txt)
+        tag = out.name
+        wb = WandbLogger(cfg, run, resume=True)
+        wb.log_table(f"eval/{tag}/per_patient", df)
+        wb.log_table(f"eval/{tag}/summary", summary)
+        wb.summary(summary_metrics(summary, tag))
+        wb.finish()
 
 
 if __name__ == "__main__":

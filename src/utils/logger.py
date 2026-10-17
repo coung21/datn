@@ -48,13 +48,14 @@ class WandbLogger:
             self.run.log(data, step=step)
 
     def log_examples(self, key: str, examples: list[dict], step: int) -> None:
+        """Mỗi region một key riêng (<key>/brain, <key>/pelvis): ảnh khác kích thước không chung 1 panel."""
         if self.run and examples:
-            images = [
-                self._wandb.Image(example_panel(e["mr"], e["sct"], e["ct"], e["mask"]),
-                                  caption=f"{e['id']} z={e['z']} | MR | sCT | CT | |err|<={ERR_MAX:.0f}HU")
-                for e in examples
-            ]
-            self.run.log({key: images}, step=step)
+            data = {}
+            for e in examples:
+                img = self._wandb.Image(example_panel(e["mr"], e["sct"], e["ct"], e["mask"]),
+                                        caption=f"{e['id']} z={e['z']} | MR | sCT | CT | |err|<={ERR_MAX:.0f}HU")
+                data.setdefault(f"{key}/{e.get('region', 'all')}", []).append(img)
+            self.run.log(data, step=step)
 
     def log_table(self, key: str, df) -> None:
         if self.run:

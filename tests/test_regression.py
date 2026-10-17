@@ -164,30 +164,35 @@ def test_wandb_disabled_is_noop(tmp_path):
     assert wb.run is None and not (tmp_path / "wandb_id.txt").exists()
 
 
-def test_wandb_enabled_with_fake_module(tmp_path, monkeypatch):
-    """Chỉ dùng wandb.init / Image / Table: không phụ thuộc API nội bộ (vd wandb.util) đổi theo phiên bản."""
-    calls = {}
+@pytest.fixture
+def fake_wandb(monkeypatch):
+    """Module wandb giả, chỉ có init / Image / Table: không phụ thuộc API nội bộ đổi theo phiên bản."""
+    calls = {"inits": [], "log": [], "summary": {}}
 
     class FakeRun:
-        id = None
-        summary = {}
+        def __init__(self, run_id):
+            self.id = run_id
+            self.summary = calls["summary"]
 
         def log(self, data, step=None):
-            calls.setdefault("log", []).append((data, step))
+            calls["log"].append((data, step))
 
         def finish(self):
             calls["finish"] = True
 
     def fake_init(**kw):
         calls["init"] = kw
-        run = FakeRun()
-        run.id = kw["id"]
-        return run
+        calls["inits"].append(kw)
+        return FakeRun(kw["id"])
 
     fake = type(sys)("wandb")
     fake.init, fake.Image, fake.Table = fake_init, lambda arr, caption=None: arr, lambda dataframe: dataframe
     monkeypatch.setitem(sys.modules, "wandb", fake)
+    return calls
 
+
+def test_wandb_enabled_with_fake_module(tmp_path, fake_wandb):
+    calls = fake_wandb
     run_dir = tmp_path / "regression_20261016-230229"
     run_dir.mkdir()
     cfg = {"run_name": "regression", "logging": {"wandb": {"enabled": True, "project": "mri2ct", "entity": "e"}}}
@@ -200,6 +205,38 @@ def test_wandb_enabled_with_fake_module(tmp_path, monkeypatch):
     assert calls["log"] == [({"train/loss": 1.0}, 3)] and calls["finish"]
     WandbLogger(cfg, run_dir, resume=True)
     assert calls["init"]["id"] == run_id  # resume giữ nguyên id
+
+
+def test_wandb_train_then_evaluate(tiny_run, fake_wandb, monkeypatch):
+    calls = fake_wandb
+    _, run = tiny_run
+    run_dir = run("logging.wandb.enabled=true", "logging.wandb.entity=e")
+    train_id = calls["inits"][0]["id"]
+
+    # ảnh mẫu: mỗi region 1 key riêng
+    example_keys = {k for data, _ in calls["log"] for k in data if k.startswith("val/examples")}
+    assert example_keys == {"val/examples/brain", "val/examples/pelvis"}
+
+    monkeypatch.setattr(sys, "argv", ["evaluate", "--run", str(run_dir), "--ckpt", "best", "--split", "test"])
+    evaluate.main()
+    assert calls["inits"][-1]["id"] == train_id  # ghi tiếp vào đúng run train
+    logged = {k for data, _ in calls["log"] for k in data}
+    assert {"eval/test_best/per_patient", "eval/test_best/summary"} <= logged
+    assert calls["summary"]["test_best/nfe1/all/mae"] > 0
+    assert "test_best_no_special/nfe1/brain/mae" in calls["summary"]
+
+
+def test_summary_metrics_keys():
+    summary = pd.DataFrame([
+        {"subset": "all", "nfe": 4, "region": "pelvis", "n": 2, "mae_mean": 50.0, "mae_std": 1.0,
+         "psnr_mean": 29.0, "psnr_std": 1.0, "ssim_mean": 0.8, "ssim_std": 0.1},
+        {"subset": "no_special", "nfe": 4, "region": "all", "n": 1, "mae_mean": 40.0, "mae_std": 0.0,
+         "psnr_mean": 30.0, "psnr_std": 0.0, "ssim_mean": 0.9, "ssim_std": 0.0},
+    ])
+    m = evaluate.summary_metrics(summary, "test_best")
+    assert m == {"test_best/nfe4/pelvis/mae": 50.0, "test_best/nfe4/pelvis/psnr": 29.0,
+                 "test_best/nfe4/pelvis/ssim": 0.8, "test_best_no_special/nfe4/all/mae": 40.0,
+                 "test_best_no_special/nfe4/all/psnr": 30.0, "test_best_no_special/nfe4/all/ssim": 0.9}
 
 
 def test_summarize_special():
