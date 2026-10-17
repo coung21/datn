@@ -1,0 +1,11 @@
+# Rectified flow (conditional flow matching) MR -> CT. Train giống hệt baseline regression.
+run_name: flow_matching
+method:
+  name: flow_matching
+  fix_background: true   # ngoài mask x_t luôn = -1 khi train và khi sinh
+model:
+  in_channels: 4         # 1 (x_t) + 3 lát MR
+train:
+  val_fast_nfe: [1, 4]
+  val_full:
+    nfe: 4

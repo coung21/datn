@@ -4,6 +4,7 @@ einops>=0.7           # reshape tensor gọn cho attention, 2.5D
 # ---- Đọc/ghi ảnh y tế ----
 SimpleITK>=2.3        # đọc .nii.gz/.mha của SynthRAD, giữ spacing/origin khi ghi sCT
 monai>=1.3            # sliding_window_inference (ghép patch trọng số Gaussian)
+flow_matching>=1.0    # CondOTProbPath + ODESolver cho rectified flow (kéo theo torchdiffeq)
 
 # ---- Xử lý số liệu ----
 numpy>=1.24

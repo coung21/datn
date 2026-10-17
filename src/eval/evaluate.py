@@ -33,7 +33,7 @@ def load_checkpoint(path, device) -> tuple[torch.nn.Module, Method, dict, dict]:
     cfg = ckpt["cfg"]
     model = UNetModel(**cfg["model"])
     model.load_state_dict(ckpt["model"])
-    return model.to(device).eval(), build_method(cfg["method"]["name"]), cfg, ckpt
+    return model.to(device).eval(), build_method(**cfg["method"]), cfg, ckpt
 
 
 def val_fast(

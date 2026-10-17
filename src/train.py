@@ -105,7 +105,7 @@ def main():
         raise ValueError(f"precision {tc['precision']} chưa hỗ trợ (bf16 | fp32)")
     amp_dtype = AUTOCAST_DTYPES[tc["precision"]]
 
-    method = build_method(cfg["method"]["name"])
+    method = build_method(**cfg["method"])
     expected_in = method.extra_in_channels + 2 * dc["context_slices"] + 1
     if cfg["model"]["in_channels"] != expected_in:
         raise ValueError(f"model.in_channels phải là {expected_in} cho method {cfg['method']['name']}")

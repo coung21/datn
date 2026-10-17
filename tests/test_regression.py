@@ -1,4 +1,3 @@
-import json
 import math
 import re
 import sys
@@ -7,14 +6,13 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-from test_dataset import make_patient
+from conftest import make_tiny_run
 
 from src.eval import evaluate
 from src.eval.metrics import all_metrics
 from src.methods import Regression, build_method, masked_l1
 from src.models import UNetModel
 from src.train import cosine_with_warmup
-from src.train import main as train_main
 from src.utils.config import apply_overrides, deep_merge, load_config
 from src.utils.logger import WandbLogger, example_panel
 
@@ -40,7 +38,8 @@ def test_regression_loss_and_predict():
     loss.backward()
     assert loss.ndim == 0 and logs["l1"] == pytest.approx(loss.item())
     assert model.input_blocks[0][0].weight.grad is not None
-    out = method.predict(model.eval(), batch["cond"])
+    model.eval()
+    out = method.sample(lambda inp, t: model(inp, t), batch["cond"], batch["mask"], torch.randn(2, 1, 32, 32), nfe=1)
     assert out.shape == (2, 1, 32, 32) and out.min() >= -1 and out.max() <= 1
 
 
@@ -81,38 +80,7 @@ def test_config(tmp_path):
 
 @pytest.fixture
 def tiny_run(tmp_path, monkeypatch):
-    """Dữ liệu giả + ghi đè config để train vài step trên CPU."""
-    ids = {"train": ["1BA001", "1BA002", "1PA001", "1PA002"], "val": ["1BB001", "1PC001"], "test": ["1BC001"]}
-    for i, pid in enumerate(sum(ids.values(), [])):
-        make_patient(tmp_path / "processed", pid, spacing_z=1.0 if pid[1] == "B" else 2.5, seed=i)
-    (tmp_path / "split.json").write_text(json.dumps({**ids, "special": {"1PC001": "MR: test"}}))
-    overrides = [
-        f"output_dir={tmp_path.as_posix()}", f"data.processed_dir={(tmp_path / 'processed').as_posix()}",
-        f"data.split.file={(tmp_path / 'split.json').as_posix()}", "data.patch_size=32", "data.num_workers=0",
-        "data.pin_memory=false", *(f"model.{k}={list(v) if isinstance(v, tuple) else v}" for k, v in TINY_MODEL.items()),
-        "train.batch_size=2", "train.grad_accum=2", "train.total_images=24", "train.log_every=2",
-        "train.val_every=3", "train.save_every=3", "train.lr_schedule.warmup_steps=2", "train.precision=fp32",
-        "train.cudnn_benchmark=false", "inference.precision=fp32", "inference.roi_size=32", "inference.sw_batch_size=4",
-        "logging.wandb.enabled=false",
-    ]
-
-    runs = tmp_path / "runs"
-
-    def run(*extra, resume=None):
-        """Train mới (trả về thư mục run vừa tạo) hoặc train tiếp run `resume`."""
-        before = set(runs.glob("*")) if runs.exists() else set()
-        if resume:
-            argv = ["train", "--resume", str(resume), "--set", *extra]
-        else:
-            argv = ["train", "--exp", "configs/exp/regression.yaml", "--set", *overrides, *extra]
-        monkeypatch.setattr(sys, "argv", argv)
-        train_main()
-        if resume:
-            return resume
-        (new,) = set(runs.glob("*")) - before
-        return new
-
-    return runs, run
+    return make_tiny_run(tmp_path, monkeypatch, "configs/exp/regression.yaml", in_channels=3)
 
 
 def test_train_end_to_end(tiny_run, monkeypatch, capsys):
