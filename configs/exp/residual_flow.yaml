@@ -4,7 +4,8 @@ run_name: residual_flow
 method:
   name: residual_flow
   sigma: 0.5     # độ lớn noise xuất phát; ablation 0 / 1
-  scale: null    # độ lệch chuẩn phần dư trong mask: điền từ `scripts/predict_reg.py --stats`
+  scale: 0.083   # độ lệch chuẩn phần dư trong mask, tập train dự đoán chéo (outputs/residual_stats.json:
+                 # train 0.0834 / val 0.0781 / test 0.0791; MAD-std 0.011 -> đuôi nặng nên dùng std)
 data:
   with_reg: true # cond = [MR x3, ŷ]
 model:
