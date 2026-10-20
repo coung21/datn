@@ -1,0 +1,12 @@
+# Regression train trên nửa A của tập train, dùng để dự đoán chéo ŷ cho nửa còn lại (residual flow).
+# Giống baseline regression, chỉ khác split và ngân sách (mỗi fold 126 BN -> 200k ảnh ~ 10 epoch).
+run_name: regression_foldA
+method:
+  name: regression
+model:
+  in_channels: 3
+data:
+  split:
+    file: configs/splits/split_seed42_foldA.json
+train:
+  total_images: 200000
