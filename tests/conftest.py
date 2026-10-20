@@ -1,6 +1,8 @@
 import json
 import sys
 
+import numpy as np
+
 from test_dataset import make_patient
 
 from src.train import main as train_main
@@ -10,11 +12,20 @@ TINY_MODEL = dict(image_size=32, model_channels=32, channel_mult=(1, 2), num_res
                   attention_resolutions=(16,), num_head_channels=32)
 
 
-def make_tiny_run(tmp_path, monkeypatch, exp: str, in_channels: int):
+def write_fake_reg(patient_dir, seed: int, err_hu: float = 60.0) -> None:
+    """reg.npy giả: CT + nhiễu ~err_hu HU trong mask, -1024 ngoài mask (như output của predict_reg)."""
+    ct, mask = np.load(patient_dir / "ct.npy"), np.load(patient_dir / "mask.npy") > 0
+    noisy = ct + np.random.default_rng(seed).normal(0, err_hu, ct.shape)
+    np.save(patient_dir / "reg.npy", np.where(mask, np.clip(noisy, -1024, 3000), -1024).round().astype(np.int16))
+
+
+def make_tiny_run(tmp_path, monkeypatch, exp: str, in_channels: int, with_reg: bool = False):
     """Dữ liệu giả + ghi đè config. Trả về (thư mục runs, run(*extra, resume=None) -> thư mục run)."""
     ids = {"train": ["1BA001", "1BA002", "1PA001", "1PA002"], "val": ["1BB001", "1PC001"], "test": ["1BC001"]}
     for i, pid in enumerate(sum(ids.values(), [])):
         make_patient(tmp_path / "processed", pid, spacing_z=1.0 if pid[1] == "B" else 2.5, seed=i)
+        if with_reg:
+            write_fake_reg(tmp_path / "processed" / ("brain" if pid[1] == "B" else "pelvis") / pid, seed=100 + i)
     (tmp_path / "split.json").write_text(json.dumps({**ids, "special": {"1PC001": "MR: test"}}))
     model = {**TINY_MODEL, "in_channels": in_channels}
     overrides = [

@@ -1,8 +1,9 @@
 from .base import Method, masked_l1, masked_mse
 from .flow_matching import FlowMatching
 from .regression import Regression
+from .residual_flow import ResidualFlow
 
-METHODS = {"regression": Regression, "flow_matching": FlowMatching}
+METHODS = {"regression": Regression, "flow_matching": FlowMatching, "residual_flow": ResidualFlow}
 
 
 def build_method(name: str, **kwargs) -> Method:
@@ -11,4 +12,4 @@ def build_method(name: str, **kwargs) -> Method:
     return METHODS[name](**kwargs)
 
 
-__all__ = ["METHODS", "FlowMatching", "Method", "Regression", "build_method", "masked_l1", "masked_mse"]
+__all__ = ["METHODS", "FlowMatching", "Method", "Regression", "ResidualFlow", "build_method", "masked_l1", "masked_mse"]

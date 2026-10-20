@@ -1,0 +1,15 @@
+# Residual flow matching: flow sinh phần dư của regression (ŷ = reg.npy, dự đoán chéo 2-fold cho train,
+# model regression đầy đủ cho val/test). Train giống hệt regression và flow matching.
+run_name: residual_flow
+method:
+  name: residual_flow
+  sigma: 0.5     # độ lớn noise xuất phát; ablation 0 / 1
+  scale: null    # độ lệch chuẩn phần dư trong mask: điền từ `scripts/predict_reg.py --stats`
+data:
+  with_reg: true # cond = [MR x3, ŷ]
+model:
+  in_channels: 5 # 1 (z_t) + 3 MR + 1 ŷ
+train:
+  val_fast_nfe: [1, 2]
+  val_full:
+    nfe: 2

@@ -106,7 +106,10 @@ def main():
     amp_dtype = AUTOCAST_DTYPES[tc["precision"]]
 
     method = build_method(**cfg["method"])
-    expected_in = method.extra_in_channels + 2 * dc["context_slices"] + 1
+    with_reg = dc.get("with_reg", False)
+    if method.needs_reg != with_reg:
+        raise ValueError(f"method {cfg['method']['name']} cần data.with_reg={method.needs_reg}")
+    expected_in = method.extra_in_channels + 2 * dc["context_slices"] + 1 + int(with_reg)
     if cfg["model"]["in_channels"] != expected_in:
         raise ValueError(f"model.in_channels phải là {expected_in} cho method {cfg['method']['name']}")
     model = UNetModel(**cfg["model"]).to(device)

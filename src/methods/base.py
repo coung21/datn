@@ -27,8 +27,10 @@ class Method(ABC):
     Ảnh CT và MR đều ở thang [-1, 1]; cond là [N, C_mr, H, W], mask là [N, 1, H, W].
     """
 
-    # Số kênh model nhận ngoài các kênh MR (vd 1 kênh x_t cho flow matching)
+    # Số kênh model nhận ngoài cond (vd 1 kênh x_t cho flow matching)
     extra_in_channels: int = 0
+    # cond có kèm ŷ (sCT regression) ở kênh cuối không (data.with_reg)
+    needs_reg: bool = False
 
     @abstractmethod
     def loss(self, model: nn.Module, batch: dict) -> tuple[torch.Tensor, dict[str, float]]:

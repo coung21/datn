@@ -74,7 +74,7 @@ def build_dataset(cfg: dict, ids: list[str], mode: str) -> "SliceDataset":
         patch_size=d["patch_size"], context_slices=d["context_slices"], context_mm=d["context_mm"],
         min_foreground=d["min_foreground"], hflip=d["hflip"], ct_clip=d["ct_clip"],
         mr_percentiles=d["mr_percentiles"], pad_value=d["pad_value"],
-        val_slices_per_patient=d["val_slices_per_patient"],
+        val_slices_per_patient=d["val_slices_per_patient"], with_reg=d.get("with_reg", False),
     )
 
 
@@ -94,6 +94,7 @@ class SliceDataset(Dataset):
         pad_value: float = -1.0,
         val_slices_per_patient: int = 5,
         max_crop_tries: int = 10,
+        with_reg: bool = False,
     ):
         assert mode in ("train", "val"), mode
         self.root = Path(processed_dir)
@@ -107,6 +108,8 @@ class SliceDataset(Dataset):
         self.mr_keys = tuple(str(float(p)) for p in mr_percentiles)
         self.pad_value = pad_value
         self.max_crop_tries = max_crop_tries
+        # residual flow: nối sCT của regression (reg.npy, HU) vào cuối cond như 1 kênh điều kiện
+        self.with_reg = with_reg
 
         self.metas = {pid: json.loads((self._dir(pid) / "meta.json").read_text()) for pid in ids}
         self.index: list[tuple[str, int]] = []
@@ -131,7 +134,8 @@ class SliceDataset(Dataset):
     def _arrays(self, pid: str) -> dict[str, np.ndarray]:
         if pid not in self._cache:
             d = self._dir(pid)
-            self._cache[pid] = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in ("ct", "mr", "mask")}
+            keys = ("ct", "mr", "mask", "reg") if self.with_reg else ("ct", "mr", "mask")
+            self._cache[pid] = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in keys}
         return self._cache[pid]
 
     def load_volume(self, pid: str) -> tuple[np.ndarray, np.ndarray]:
@@ -140,7 +144,10 @@ class SliceDataset(Dataset):
         return np.asarray(arr["ct"], dtype=np.float32), np.asarray(arr["mask"])
 
     def load_slice(self, pid: str, z: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Lát z nguyên kích thước (sau bbox), đã chuẩn hóa: mr [C,H,W], ct [1,H,W], mask [1,H,W]."""
+        """Lát z nguyên kích thước (sau bbox), đã chuẩn hóa: cond [C,H,W], ct [1,H,W], mask [1,H,W].
+
+        cond = các lát MR (2*context_slices+1 kênh), thêm ŷ (sCT regression lát z) ở cuối nếu with_reg.
+        """
         meta, arr = self.metas[pid], self._arrays(pid)
         stride = slice_stride(meta["spacing"][2], self.context_mm)
         zs = neighbor_indices(z, meta["shape"][0], self.context_slices, stride)
@@ -148,6 +155,8 @@ class SliceDataset(Dataset):
         mr = normalize_mr(np.asarray(arr["mr"][zs]), p[self.mr_keys[0]], p[self.mr_keys[1]])
         ct = normalize_ct(np.asarray(arr["ct"][z])[None], self.ct_clip)
         mask = np.asarray(arr["mask"][z])[None].astype(np.float32)
+        if self.with_reg:
+            mr = np.concatenate([mr, normalize_ct(np.asarray(arr["reg"][z])[None], self.ct_clip)])
         return mr, ct, mask
 
     def _crop_origin(self, mask: np.ndarray) -> tuple[int, int]:
