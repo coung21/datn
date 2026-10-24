@@ -52,6 +52,19 @@ def cosine_with_warmup(total_steps: int, warmup_steps: int, min_ratio: float):
     return fn
 
 
+def init_from_checkpoint(model: torch.nn.Module, path) -> None:
+    """Khởi tạo từ checkpoint (vd teacher của reflow). Chỉ cho phép thiếu label_emb (khởi tạo 0,
+    nên model có điều kiện lớp lúc đầu cho kết quả y hệt checkpoint)."""
+    state = torch.load(path, map_location="cpu", weights_only=True)["model"]
+    try:
+        missing, unexpected = model.load_state_dict(state, strict=False)
+    except RuntimeError as e:  # lệch kích thước tensor
+        raise ValueError(f"init_from {path} không khớp model: {e}") from e
+    if unexpected or any(not k.startswith("label_emb.") for k in missing):
+        raise ValueError(f"init_from {path} không khớp model: thiếu {missing}, thừa {unexpected}")
+    print(f"Khởi tạo từ {path}" + (f" (mới: {missing})" if missing else ""), flush=True)
+
+
 def infinite(loader):
     while True:
         yield from loader
@@ -109,7 +122,15 @@ def main():
     expected_in = method.extra_in_channels + 2 * dc["context_slices"] + 1
     if cfg["model"]["in_channels"] != expected_in:
         raise ValueError(f"model.in_channels phải là {expected_in} cho method {cfg['method']['name']}")
-    model = UNetModel(**cfg["model"]).to(device)
+    if method.needs_pairs:
+        if not dc.get("reflow"):
+            raise ValueError(f"method {cfg['method']['name']} cần data.reflow (cặp sinh bởi teacher)")
+        if dc["patch_size"] != cfg["inference"]["roi_size"]:
+            raise ValueError("reflow cần data.patch_size == inference.roi_size để noise sinh lại khớp với teacher")
+    model = UNetModel(**cfg["model"])
+    if tc.get("init_from") and not args.resume:
+        init_from_checkpoint(model, tc["init_from"])
+    model = model.to(device)
     print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M tham số, device {device}", flush=True)
 
     split = load_split(dc["split"]["file"])

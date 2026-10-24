@@ -29,6 +29,8 @@ class Method(ABC):
 
     # Số kênh model nhận ngoài các kênh MR (vd 1 kênh x_t cho flow matching)
     extra_in_channels: int = 0
+    # batch có cặp (noise, x1) sinh sẵn bởi teacher không (data.reflow)
+    needs_pairs: bool = False
 
     @abstractmethod
     def loss(self, model: nn.Module, batch: dict) -> tuple[torch.Tensor, dict[str, float]]:

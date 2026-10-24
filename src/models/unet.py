@@ -26,6 +26,8 @@ class UNetModel(nn.Module):
         time_scale: nhân t trước khi embed; với t liên tục trong [0, 1] (flow matching)
             đặt 1000 để giữ dải tần giống ADM, với t nguyên (DDPM) đặt 1.
         resblock_updown: dùng ResBlock để up/down thay cho Upsample/Downsample.
+        num_classes: số lớp điều kiện (vd 2: brain/pelvis); embedding lớp cộng vào time embedding
+            như ADM. Khởi tạo 0 để model có lớp nạp từ checkpoint không lớp cho kết quả y hệt ban đầu.
     """
 
     def __init__(
@@ -44,6 +46,7 @@ class UNetModel(nn.Module):
         resblock_updown: bool = True,
         time_scale: float = 1000.0,
         use_checkpoint: bool = False,
+        num_classes: int | None = None,
     ):
         super().__init__()
         self.image_size = image_size
@@ -53,6 +56,7 @@ class UNetModel(nn.Module):
         self.time_scale = time_scale
         self.use_checkpoint = use_checkpoint
         self.num_levels = len(channel_mult)
+        self.num_classes = num_classes
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -60,6 +64,9 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             nn.Linear(time_embed_dim, time_embed_dim),
         )
+        if num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+            nn.init.zeros_(self.label_emb.weight)
 
         def res_block(ch_in, ch_out, up=False, down=False):
             return ResBlock(
@@ -132,7 +139,8 @@ class UNetModel(nn.Module):
         return block(h, emb)
 
     def forward(
-        self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None
+        self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None,
+        y: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -140,6 +148,7 @@ class UNetModel(nn.Module):
             t: [N] (hoặc scalar) timestep.
             cond: [N, C_cond, H, W] ảnh điều kiện, ghép với x theo kênh.
                 Tổng C_x + C_cond phải bằng in_channels.
+            y: [N] (hoặc scalar) nhãn lớp, bắt buộc khi model có num_classes.
         Returns:
             [N, out_channels, H, W].
         """
@@ -156,6 +165,13 @@ class UNetModel(nn.Module):
             t = t.expand(x.shape[0])
 
         emb = self.time_embed(timestep_embedding(t * self.time_scale, self.model_channels))
+        if self.num_classes is not None:
+            assert y is not None, "model có num_classes cần nhãn y"
+            if y.ndim == 0:
+                y = y.expand(x.shape[0])
+            emb = emb + self.label_emb(y)
+        else:
+            assert y is None, "model không có num_classes nhưng nhận nhãn y"
 
         hs = []
         h = x

@@ -11,6 +11,7 @@ mode="val"  : val_slices_per_patient lát cố định mỗi bệnh nhân, trả
 """
 
 import json
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +63,23 @@ def pad_to(arr: np.ndarray, size: int, value: float) -> np.ndarray:
     return np.pad(arr, pad, constant_values=value)
 
 
+REGION_INDEX = {"brain": 0, "pelvis": 1}  # nhãn lớp cho model có num_classes
+
+
+def padded_shape(h: int, w: int, size: int) -> tuple[int, int]:
+    """Kích thước lát sau pad_to(size)."""
+    return max(h, size), max(w, size)
+
+
+def slice_noise(pid: str, z: int, shape: tuple[int, int], seed: int = 0) -> torch.Tensor:
+    """Noise [1, H, W] cố định theo (bệnh nhân, lát, seed) trên lát đã pad: tái lập được trên mọi máy.
+
+    Dùng chung cho suy luận (seed 0) và để sinh lại noise của cặp reflow lúc train.
+    """
+    g = torch.Generator().manual_seed(zlib.crc32(f"{pid}:{z}".encode()) ^ seed)
+    return torch.randn((1, *shape), generator=g)
+
+
 def load_split(path) -> dict:
     return json.loads(Path(path).read_text())
 
@@ -74,7 +92,7 @@ def build_dataset(cfg: dict, ids: list[str], mode: str) -> "SliceDataset":
         patch_size=d["patch_size"], context_slices=d["context_slices"], context_mm=d["context_mm"],
         min_foreground=d["min_foreground"], hflip=d["hflip"], ct_clip=d["ct_clip"],
         mr_percentiles=d["mr_percentiles"], pad_value=d["pad_value"],
-        val_slices_per_patient=d["val_slices_per_patient"],
+        val_slices_per_patient=d["val_slices_per_patient"], reflow=d.get("reflow"),
     )
 
 
@@ -94,6 +112,7 @@ class SliceDataset(Dataset):
         pad_value: float = -1.0,
         val_slices_per_patient: int = 5,
         max_crop_tries: int = 10,
+        reflow: dict | None = None,
     ):
         assert mode in ("train", "val"), mode
         self.root = Path(processed_dir)
@@ -107,6 +126,9 @@ class SliceDataset(Dataset):
         self.mr_keys = tuple(str(float(p)) for p in mr_percentiles)
         self.pad_value = pad_value
         self.max_crop_tries = max_crop_tries
+        # reflow: {"file": tên .npy sCT của teacher (HU), "noise_seed": seed noise đã dùng khi sinh}
+        # -> mẫu train có thêm x1 (sCT teacher) và noise (sinh lại, cùng crop/lật)
+        self.reflow = reflow
 
         self.metas = {pid: json.loads((self._dir(pid) / "meta.json").read_text()) for pid in ids}
         self.index: list[tuple[str, int]] = []
@@ -131,7 +153,10 @@ class SliceDataset(Dataset):
     def _arrays(self, pid: str) -> dict[str, np.ndarray]:
         if pid not in self._cache:
             d = self._dir(pid)
-            self._cache[pid] = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in ("ct", "mr", "mask")}
+            # cặp reflow chỉ có cho tập train và chỉ dùng khi train
+            with_pairs = self.reflow and self.mode == "train"
+            keys = ("ct", "mr", "mask") + ((self.reflow["file"],) if with_pairs else ())
+            self._cache[pid] = {k: np.load(d / f"{k}.npy", mmap_mode="r") for k in keys}
         return self._cache[pid]
 
     def load_volume(self, pid: str) -> tuple[np.ndarray, np.ndarray]:
@@ -175,20 +200,29 @@ class SliceDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         pid, z = self.index[i]
         mr, ct, mask = self.load_slice(pid, z)
-        sample = {"id": pid, "z": z}
+        sample = {"id": pid, "z": z, "y": REGION_INDEX[parse_id(pid)["region"]]}
 
         if self.mode == "train":
             size = self.patch_size
             mr = pad_to(mr, size, self.pad_value)
             ct = pad_to(ct, size, self.pad_value)
             mask = pad_to(mask, size, 0.0)
+            extra = {}
+            if self.reflow:  # (mode train)
+                x1 = normalize_ct(np.asarray(self._arrays(pid)[self.reflow["file"]][z])[None], self.ct_clip)
+                extra["x1"] = pad_to(x1, size, self.pad_value)
+                # noise trên cả lát đã pad, đúng như lúc teacher sinh x1 (predict_volume, roi = patch)
+                extra["noise"] = slice_noise(pid, z, mask.shape[-2:], self.reflow["noise_seed"]).numpy()
             y0, x0 = self._crop_origin(mask[0])
             win = (slice(None), slice(y0, y0 + size), slice(x0, x0 + size))
             mr, ct, mask = mr[win], ct[win], mask[win]
+            extra = {k: v[win] for k, v in extra.items()}
             flip = bool(torch.rand(()) < self.hflip)
             if flip:
                 mr, ct, mask = mr[..., ::-1], ct[..., ::-1], mask[..., ::-1]
+                extra = {k: v[..., ::-1] for k, v in extra.items()}
             sample.update(origin=(y0, x0), flip=flip)
+            sample.update({k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in extra.items()})
 
         sample.update(
             cond=torch.from_numpy(np.ascontiguousarray(mr)),
