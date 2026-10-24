@@ -1,0 +1,13 @@
+# Flow matching MR -> CT: xuất phát từ lát MR giữa (không từ noise), đích là CT.
+# Train giống hệt regression và flow matching (400k ảnh, bf16, 8 x 4, lr 2e-4 cosine).
+run_name: mr_bridge
+method:
+  name: mr_bridge
+  sigma: 0.0           # 0: cầu nối tất định; >0: thêm noise vào điểm xuất phát (ablation)
+  fix_background: true
+model:
+  in_channels: 4       # 1 (x_t) + 3 lát MR
+train:
+  val_fast_nfe: [1, 2, 4]
+  val_full:
+    nfe: 2

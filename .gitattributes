@@ -1,0 +1,2 @@
+# script shell chạy trong WSL: luôn giữ LF kể cả khi checkout bằng git trên Windows
+*.sh text eol=lf
