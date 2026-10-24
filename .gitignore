@@ -9,3 +9,7 @@ outputs/**
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Antigravity
+antigravity/
+my-skills/
