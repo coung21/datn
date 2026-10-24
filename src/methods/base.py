@@ -11,6 +11,11 @@ def masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> t
     return ((pred - target).abs() * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """MSE trung bình trên các điểm trong mask."""
+    return ((pred - target) ** 2 * mask).sum() / mask.sum().clamp_min(1.0)
+
+
 class Method(ABC):
     """Mỗi phương pháp định nghĩa loss khi train và cách sinh CT từ MR khi suy luận.
 

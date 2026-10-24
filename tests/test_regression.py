@@ -245,3 +245,21 @@ def test_summarize_special():
     s = evaluate.summarize(df).set_index(["subset", "region"])
     assert s.loc[("all", "brain"), "mae_mean"] == 20 and s.loc[("no_special", "brain"), "mae_mean"] == 10
     assert s.loc[("all", "all"), "n"] == 3 and s.loc[("no_special", "all"), "n"] == 2
+
+
+def test_regression_l2_loss_option():
+    from src.methods import masked_mse
+    torch.manual_seed(0)
+    model = UNetModel(**TINY_MODEL)
+    batch = {"cond": torch.randn(2, 3, 32, 32), "ct": torch.rand(2, 1, 32, 32) * 2 - 1,
+             "mask": (torch.rand(2, 1, 32, 32) > 0.3).float()}
+    l1, logs1 = build_method("regression").loss(model, batch)  # mặc định vẫn là L1
+    l2, logs2 = build_method("regression", loss="l2").loss(model, batch)
+    with torch.no_grad():
+        pred = model(batch["cond"], torch.zeros(2))
+    assert l1.item() == pytest.approx(masked_l1(pred, batch["ct"], batch["mask"]).item(), rel=1e-5) and "l1" in logs1
+    assert l2.item() == pytest.approx(masked_mse(pred, batch["ct"], batch["mask"]).item(), rel=1e-5) and "l2" in logs2
+    with pytest.raises(ValueError):
+        build_method("regression", loss="huber")
+    cfg = load_config("configs/base.yaml", "configs/exp/regression_l2.yaml")
+    assert cfg["method"] == {"name": "regression", "loss": "l2"} and cfg["model"]["in_channels"] == 3

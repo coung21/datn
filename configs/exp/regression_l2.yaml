@@ -1,0 +1,8 @@
+# Đối chứng cho baseline regression: giống hệt configs/exp/regression.yaml, chỉ đổi loss L1 -> L2 (MSE).
+# L1 học trung vị E_med[CT | MR], L2 học trung bình E[CT | MR] (giống flow matching ở NFE 1).
+run_name: regression_l2
+method:
+  name: regression
+  loss: l2
+model:
+  in_channels: 3   # chỉ 3 lát MR, không có x_t
