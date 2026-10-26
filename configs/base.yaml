@@ -43,9 +43,9 @@ method:
 
 train:
   precision: bf16
-  batch_size: 16                    # BatchNorm cần micro-batch đủ lớn; kiểm tra VRAM bằng scripts/benchmark.py
-  grad_accum: 2                     # batch hiệu dụng 32
-  total_images: 320000              # -> 10000 optimizer step, ~8 epoch (bản cũ 400k)
+  batch_size: 32                    # ~9.8GB, 84 img/s (scripts/benchmark.py); BatchNorm thống kê trên cả batch
+  grad_accum: 1
+  total_images: 320000              # -> 10000 optimizer step, ~8 epoch, ~1.1h compute (bản cũ 400k, ~7h)
   optimizer:
     name: adamw
     lr: 2.0e-4
