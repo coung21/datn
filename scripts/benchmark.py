@@ -1,10 +1,10 @@
-"""Benchmark UNet trên GPU: VRAM đỉnh, tốc độ train step, ước tính thời gian train/inference.
+"""Benchmark model trong configs/base.yaml trên GPU: VRAM đỉnh, tốc độ train step, ước tính thời gian.
 
 Chỉ đo phần tính toán của model (dữ liệu sinh ngẫu nhiên trên GPU), chưa tính dataloader.
 
 Ví dụ:
     python -X utf8 scripts/benchmark.py
-    python -X utf8 scripts/benchmark.py --batch-sizes 8 16 32 --precisions bf16 --checkpoint both
+    python -X utf8 scripts/benchmark.py --batch-sizes 8 16 32 --precisions bf16 --set model.norm=group
 """
 
 import argparse
@@ -19,7 +19,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.models import UNetModel  # noqa: E402
+from src.models import build_model  # noqa: E402
+from src.utils.config import load_config  # noqa: E402
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 # Kích thước trung vị (x, y, số lát) theo outputs/dataset_meta/dataset_meta.csv
@@ -36,27 +37,24 @@ def usable_gb(args, device) -> float:
     return min(args.budget_gb, total) * 0.95
 
 
-def make_batch(model: UNetModel, batch_size: int, image_size: int, device):
-    x = torch.randn(batch_size, 1, image_size, image_size, device=device)
-    cond = torch.randn(batch_size, model.in_channels - 1, image_size, image_size, device=device)
-    t = torch.rand(batch_size, device=device)
-    return x, t, cond
+def make_batch(model, batch_size: int, image_size: int, device):
+    cond = torch.randn(batch_size, model.in_channels, image_size, image_size, device=device)
+    target = torch.randn(batch_size, 1, image_size, image_size, device=device)
+    return cond, target
 
 
-def bench_train(args, batch_size: int, precision: str, checkpoint: bool, device) -> dict:
-    row = dict(batch_size=batch_size, precision=precision, checkpoint=checkpoint)
-    model = UNetModel(
-        image_size=args.image_size, in_channels=args.in_channels, use_checkpoint=checkpoint
-    ).to(device)
+def bench_train(args, batch_size: int, precision: str, device) -> dict:
+    row = dict(batch_size=batch_size, precision=precision)
+    model = build_model(args.cfg["model"]).to(device)
     model.train()
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=precision == "fp16")
     amp = precision != "fp32"
-    x, t, cond = make_batch(model, batch_size, args.image_size, device)
+    cond, target = make_batch(model, batch_size, args.image_size, device)
 
     def step():
         with torch.autocast("cuda", dtype=DTYPES[precision], enabled=amp):
-            loss = (model(x, t, cond) - x).pow(2).mean()
+            loss = (model(cond).float() - target).abs().mean()
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.step(opt)
@@ -106,16 +104,16 @@ def windows_per_slice(h: int, w: int, roi: int, overlap: float) -> int:
 @torch.no_grad()
 def bench_inference(args, precision: str, device) -> float:
     """Trả về số giây cho mỗi patch (1 lần forward) ở batch args.infer_batch."""
-    model = UNetModel(image_size=args.image_size, in_channels=args.in_channels).to(device).eval()
-    x, t, cond = make_batch(model, args.infer_batch, args.image_size, device)
+    model = build_model(args.cfg["model"]).to(device).eval()
+    cond, _ = make_batch(model, args.infer_batch, args.image_size, device)
     amp = precision != "fp32"
     with torch.autocast("cuda", dtype=DTYPES[precision], enabled=amp):
         for _ in range(args.warmup):
-            model(x, t, cond)
+            model(cond)
         torch.cuda.synchronize(device)
         start = time.perf_counter()
         for _ in range(args.steps):
-            model(x, t, cond)
+            model(cond)
         torch.cuda.synchronize(device)
     del model
     torch.cuda.empty_cache()
@@ -129,22 +127,21 @@ def fmt_hours(sec: float) -> str:
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="ghi đè configs/base.yaml")
     p.add_argument("--image-size", type=int, default=256)
-    p.add_argument("--in-channels", type=int, default=4)
-    p.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 8, 16, 32])
-    p.add_argument("--precisions", nargs="+", default=["fp16", "bf16"], choices=list(DTYPES))
-    p.add_argument("--checkpoint", choices=["off", "on", "both"], default="both")
+    p.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16, 24, 32])
+    p.add_argument("--precisions", nargs="+", default=["bf16"], choices=list(DTYPES))
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--steps", type=int, default=20)
     p.add_argument("--budget-gb", type=float, default=16.0)
-    p.add_argument("--total-iters", type=int, nargs="+", default=[50_000, 100_000, 200_000])
+    p.add_argument("--total-images", type=int, nargs="+", default=[320_000, 400_000])
     p.add_argument("--num-slices", type=int, default=39_000,
                    help="số lát train cho 1 epoch (~70%% của 55.6k lát axial)")
     p.add_argument("--infer-batch", type=int, default=16)
     p.add_argument("--overlap", type=float, default=0.25)
-    p.add_argument("--nfe", type=int, nargs="+", default=[1, 2, 4, 10, 50])
     p.add_argument("--out", default="outputs/benchmark/benchmark.csv")
     args = p.parse_args()
+    args.cfg = load_config("configs/base.yaml", None, args.set)
 
     if not torch.cuda.is_available():
         sys.exit("Cần CUDA để benchmark.")
@@ -158,22 +155,21 @@ def main():
     # (không chặn được hoàn toàn, nên còn kiểm tra thêm SPILL theo throughput ở dưới)
     torch.cuda.set_per_process_memory_fraction(usable_gb(args, device) * 1024**3 / props.total_memory, device)
     print(f"GPU: {props.name}, {gb(props.total_memory):.1f} GB, torch {torch.__version__}")
-    print(f"Patch {args.image_size}x{args.image_size}, in_channels={args.in_channels}, "
+    print(f"Patch {args.image_size}x{args.image_size}, model {args.cfg['model']}, "
           f"warmup={args.warmup}, steps={args.steps}\n")
 
-    ckpts = {"off": [False], "on": [True], "both": [False, True]}[args.checkpoint]
     rows = []
-    header = f"{'bs':>4} {'prec':>5} {'ckpt':>5} {'status':>11} {'alloc GB':>9} {'resv GB':>8} {'s/iter':>8} {'img/s':>7}"
+    header = f"{'bs':>4} {'prec':>5} {'status':>11} {'alloc GB':>9} {'resv GB':>8} {'s/iter':>8} {'img/s':>7}"
     print(header)
     print("-" * len(header))
     oom = set()
     prev_throughput = {}
-    for prec, ckpt, bs in itertools.product(args.precisions, ckpts, args.batch_sizes):
-        key = (prec, ckpt)
+    for prec, bs in itertools.product(args.precisions, args.batch_sizes):
+        key = prec
         if key in oom:  # batch nhỏ hơn đã OOM/tràn thì batch lớn hơn cũng vậy
-            r = dict(batch_size=bs, precision=prec, checkpoint=ckpt, status="SKIP")
+            r = dict(batch_size=bs, precision=prec, status="SKIP")
         else:
-            r = bench_train(args, bs, prec, ckpt, device)
+            r = bench_train(args, bs, prec, device)
             # tăng batch mà throughput giảm mạnh -> driver đang tràn VRAM sang RAM hệ thống
             if r["status"] == "OK" and r["samples_per_sec"] < 0.6 * prev_throughput.get(key, 0):
                 r["status"] = "SPILL"
@@ -182,7 +178,7 @@ def main():
             else:
                 prev_throughput[key] = r["samples_per_sec"]
         rows.append(r)
-        print(f"{bs:>4} {prec:>5} {str(ckpt):>5} {r['status']:>11} {r.get('peak_alloc_gb', '-'):>9} "
+        print(f"{bs:>4} {prec:>5} {r['status']:>11} {r.get('peak_alloc_gb', '-'):>9} "
               f"{r.get('peak_reserved_gb', '-'):>8} {r.get('sec_per_iter', '-'):>8} {r.get('samples_per_sec', '-'):>7}")
 
     out = Path(args.out)
@@ -201,8 +197,8 @@ def main():
 
     print("\n===== Ước tính thời gian train (chỉ tính compute, chưa gồm dataloader/validation) =====")
     for r in sorted(ok, key=lambda r: -r["samples_per_sec"])[:5]:
-        tag = f"bs={r['batch_size']} {r['precision']} ckpt={r['checkpoint']}"
-        iters = "  ".join(f"{n // 1000}k it: {fmt_hours(n * r['sec_per_iter'])}" for n in args.total_iters)
+        tag = f"bs={r['batch_size']} {r['precision']}"
+        iters = "  ".join(f"{n // 1000}k ảnh: {fmt_hours(n / r['samples_per_sec'])}" for n in args.total_images)
         epoch = args.num_slices / r["samples_per_sec"]
         print(f"{tag:<28} {r['samples_per_sec']:>6} img/s | 1 epoch ({args.num_slices} lát): "
               f"{fmt_hours(epoch)} | {iters}")
@@ -210,12 +206,10 @@ def main():
     prec = "bf16" if "bf16" in args.precisions else args.precisions[-1]
     sec_patch = bench_inference(args, prec, device)
     print(f"\n===== Ước tính inference ({prec}, batch {args.infer_batch}, overlap {args.overlap}) =====")
-    print(f"{sec_patch * 1000:.2f} ms / patch / NFE")
+    print(f"{sec_patch * 1000:.2f} ms / patch")
     for site, (h, w, n_slices) in MEDIAN_VOLUMES.items():
         n_win = windows_per_slice(h, w, args.image_size, args.overlap)
-        per_nfe = n_slices * n_win * sec_patch
-        est = "  ".join(f"NFE={k}: {per_nfe * k:.1f}s" for k in args.nfe)
-        print(f"{site:<7} {h}x{w}x{n_slices}, {n_win} cửa sổ/lát | 1 volume: {est}")
+        print(f"{site:<7} {h}x{w}x{n_slices}, {n_win} cửa sổ/lát | 1 volume: {n_slices * n_win * sec_patch:.1f}s")
 
 
 if __name__ == "__main__":

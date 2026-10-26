@@ -1,4 +1,4 @@
-"""Baseline: UNet hồi quy trực tiếp MR -> CT (1 lần forward, t = 0 cố định).
+"""Baseline: UNet hồi quy trực tiếp MR -> CT (1 lần forward).
 
 loss l1 (mặc định) học trung vị có điều kiện; l2 học trung bình có điều kiện E[CT | MR].
 """
@@ -19,19 +19,14 @@ class Regression(Method):
             raise ValueError(f"loss '{loss}' không có, chọn trong {sorted(LOSSES)}")
         self.loss_name = loss
 
-    @staticmethod
-    def _forward(model: nn.Module, cond: torch.Tensor) -> torch.Tensor:
-        t = torch.zeros(cond.shape[0], device=cond.device)
-        return model(cond, t)
-
-    def loss(self, model, batch):
-        pred = self._forward(model, batch["cond"])
+    def loss(self, model: nn.Module, batch):
+        pred = model(batch["cond"])
         loss = LOSSES[self.loss_name](pred.float(), batch["ct"], batch["mask"])
         return loss, {self.loss_name: loss.item()}
 
     @torch.no_grad()
     def predict(self, model, cond, nfe=1):
-        return self._forward(model, cond).float().clamp(-1, 1)
+        return model(cond).float().clamp(-1, 1)
 
     def nfe_values(self, requested):
         return [1]  # không lặp, NFE luôn bằng 1

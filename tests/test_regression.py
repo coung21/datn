@@ -10,16 +10,15 @@ import torch
 from test_dataset import make_patient
 
 from src.eval import evaluate
-from src.eval.metrics import all_metrics
+from src.eval.metrics import TISSUES, all_metrics
 from src.methods import Regression, build_method, masked_l1
-from src.models import UNetModel
+from src.models import UNet2D
 from src.train import cosine_with_warmup
 from src.train import main as train_main
 from src.utils.config import apply_overrides, deep_merge, load_config
 from src.utils.logger import WandbLogger, example_panel
 
-TINY_MODEL = dict(image_size=32, in_channels=3, model_channels=32, channel_mult=(1, 2), num_res_blocks=1,
-                  attention_resolutions=(16,), num_head_channels=32)
+TINY_MODEL = dict(in_channels=3, out_channels=1, base_channels=8, depth=2, norm="batch")
 
 
 def test_masked_l1():
@@ -31,7 +30,7 @@ def test_masked_l1():
 
 def test_regression_loss_and_predict():
     torch.manual_seed(0)
-    model = UNetModel(**TINY_MODEL)
+    model = UNet2D(**TINY_MODEL)
     method = build_method("regression")
     assert isinstance(method, Regression) and method.nfe_values([1, 4, 10]) == [1]
     batch = {"cond": torch.randn(2, 3, 32, 32), "ct": torch.rand(2, 1, 32, 32) * 2 - 1,
@@ -39,7 +38,7 @@ def test_regression_loss_and_predict():
     loss, logs = method.loss(model, batch)
     loss.backward()
     assert loss.ndim == 0 and logs["l1"] == pytest.approx(loss.item())
-    assert model.input_blocks[0][0].weight.grad is not None
+    assert model.down[0][0].weight.grad is not None
     out = method.predict(model.eval(), batch["cond"])
     assert out.shape == (2, 1, 32, 32) and out.min() >= -1 and out.max() <= 1
 
@@ -60,6 +59,22 @@ def test_metrics():
     mse = ((np.clip(ct + 100, -1024, 3000) - ct)[mask > 0] ** 2).mean()
     assert r["psnr"] == pytest.approx(10 * np.log10(4024**2 / mse), rel=1e-5)
     assert 0 < r["ssim"] < 1
+    for t in ("air", "fat", "soft", "marrow", "cortical"):
+        sel = (mask > 0) & (ct >= TISSUES[t][0]) & (ct < TISSUES[t][1])
+        assert r[f"mae_{t}"] == pytest.approx(np.abs(np.clip(ct + 100, -1024, 3000) - ct)[sel].mean(), rel=1e-5)
+
+
+def test_ssim_shift_and_empty_tissue():
+    """SSIM tính trên thang đã dịch [0, 4024] như code chính thức; lớp mô không có điểm -> NaN."""
+    from skimage.metrics import structural_similarity
+    rng = np.random.default_rng(1)
+    ct = np.full((8, 32, 32), 40.0, np.float32) + rng.normal(0, 30, (8, 32, 32)).astype(np.float32)
+    sct = ct + rng.normal(0, 50, ct.shape).astype(np.float32)
+    mask = np.ones_like(ct, dtype=np.uint8)
+    _, smap = structural_similarity(ct + 1024, sct + 1024, data_range=4024, full=True)
+    r = all_metrics(sct, ct, mask)
+    assert r["ssim"] == pytest.approx(smap.mean(), rel=1e-5)
+    assert math.isnan(r["mae_air"]) and not math.isnan(r["mae_soft"])
 
 
 def test_cosine_with_warmup():
@@ -74,9 +89,9 @@ def test_config(tmp_path):
     assert deep_merge({"a": {"b": 1, "c": 2}}, {"a": {"c": 3}}) == {"a": {"b": 1, "c": 3}}
     cfg = apply_overrides({"a": {"b": 1}}, ["a.b=2.5", "x.y=[1, 2]", "flag=false"])
     assert cfg == {"a": {"b": 2.5}, "x": {"y": [1, 2]}, "flag": False}
-    cfg = load_config("configs/base.yaml", "configs/exp/regression.yaml")
-    assert cfg["model"]["in_channels"] == 3 and cfg["method"]["name"] == "regression"
-    assert cfg["model"]["model_channels"] == 64  # giữ từ base
+    cfg = load_config("configs/base.yaml", "configs/exp/unet2d_baseline.yaml")
+    assert cfg["run_name"] == "unet2d_baseline" and cfg["method"] == {"name": "regression", "loss": "l1"}
+    assert cfg["model"]["in_channels"] == 2 * cfg["data"]["context_slices"] + 1 and cfg["model"]["base_channels"] == 64
 
 
 @pytest.fixture
@@ -104,7 +119,7 @@ def tiny_run(tmp_path, monkeypatch):
         if resume:
             argv = ["train", "--resume", str(resume), "--set", *extra]
         else:
-            argv = ["train", "--exp", "configs/exp/regression.yaml", "--set", *overrides, *extra]
+            argv = ["train", "--exp", "configs/exp/unet2d_baseline.yaml", "--set", *overrides, *extra]
         monkeypatch.setattr(sys, "argv", argv)
         train_main()
         if resume:
@@ -118,7 +133,7 @@ def tiny_run(tmp_path, monkeypatch):
 def test_train_end_to_end(tiny_run, monkeypatch, capsys):
     runs, run = tiny_run
     run_dir = run()  # 24 ảnh / (2 x 2) = 6 optimizer step
-    assert re.fullmatch(r"regression_\d{8}-\d{6}", run_dir.name)
+    assert re.fullmatch(r"unet2d_baseline_\d{8}-\d{6}", run_dir.name)
     log = pd.read_csv(run_dir / "train_log.csv")
     assert log["step"].tolist() == [2, 4, 6] and log["loss"].notna().all()
     assert pd.read_csv(run_dir / "val_log.csv")["step"].tolist() == [3, 6]
@@ -250,16 +265,21 @@ def test_summarize_special():
 def test_regression_l2_loss_option():
     from src.methods import masked_mse
     torch.manual_seed(0)
-    model = UNetModel(**TINY_MODEL)
+    model = UNet2D(**TINY_MODEL).eval()  # eval: BatchNorm không đổi giữa các lần gọi
     batch = {"cond": torch.randn(2, 3, 32, 32), "ct": torch.rand(2, 1, 32, 32) * 2 - 1,
              "mask": (torch.rand(2, 1, 32, 32) > 0.3).float()}
     l1, logs1 = build_method("regression").loss(model, batch)  # mặc định vẫn là L1
     l2, logs2 = build_method("regression", loss="l2").loss(model, batch)
     with torch.no_grad():
-        pred = model(batch["cond"], torch.zeros(2))
+        pred = model(batch["cond"])
     assert l1.item() == pytest.approx(masked_l1(pred, batch["ct"], batch["mask"]).item(), rel=1e-5) and "l1" in logs1
     assert l2.item() == pytest.approx(masked_mse(pred, batch["ct"], batch["mask"]).item(), rel=1e-5) and "l2" in logs2
     with pytest.raises(ValueError):
         build_method("regression", loss="huber")
-    cfg = load_config("configs/base.yaml", "configs/exp/regression_l2.yaml")
-    assert cfg["method"] == {"name": "regression", "loss": "l2"} and cfg["model"]["in_channels"] == 3
+
+
+def test_train_uses_loss_from_config(tiny_run):
+    """train phải truyền method.loss vào build_method (lỗi cũ: luôn train bằng L1)."""
+    _, run = tiny_run
+    first = {loss: pd.read_csv(run(f"method.loss={loss}", f"run_name=loss_{loss}") / "train_log.csv")["loss"].iloc[0] for loss in ("l1", "l2")}
+    assert first["l1"] != pytest.approx(first["l2"], rel=1e-3)

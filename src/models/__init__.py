@@ -1,14 +1,8 @@
-from .attention import AttentionBlock
-from .resblock import ResBlock, TimestepBlock, TimestepEmbedSequential
-from .sampling import Downsample, Upsample
-from .unet import UNetModel
+from .unet2d import UNet2D
 
-__all__ = [
-    "AttentionBlock",
-    "Downsample",
-    "ResBlock",
-    "TimestepBlock",
-    "TimestepEmbedSequential",
-    "UNetModel",
-    "Upsample",
-]
+
+def build_model(cfg_model: dict) -> UNet2D:
+    return UNet2D(**cfg_model)
+
+
+__all__ = ["UNet2D", "build_model"]

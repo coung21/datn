@@ -1,7 +1,7 @@
 """Train 1 phương pháp MR -> CT theo config.
 
-    python -X utf8 -m src.train --exp configs/exp/regression.yaml
-    python -X utf8 -m src.train --resume outputs/runs/regression_20261016-231500
+    python -X utf8 -m src.train --exp configs/exp/unet2d_baseline.yaml
+    python -X utf8 -m src.train --resume outputs/runs/unet2d_baseline_20261026-120000
     python -X utf8 -m src.train --exp ... --set train.total_images=4000 data.num_workers=0
 
 Đầu ra trong <output_dir>/runs/<run_name>_<YYYYmmdd-HHMMSS>/:
@@ -29,7 +29,7 @@ from tqdm.auto import tqdm
 from .data.dataset import build_dataset, load_split
 from .eval.evaluate import evaluate_volumes, load_checkpoint, val_fast
 from .methods import build_method
-from .models import UNetModel
+from .models import build_model
 from .utils.config import load_config
 from .utils.logger import WandbLogger
 
@@ -105,11 +105,11 @@ def main():
         raise ValueError(f"precision {tc['precision']} chưa hỗ trợ (bf16 | fp32)")
     amp_dtype = AUTOCAST_DTYPES[tc["precision"]]
 
-    method = build_method(cfg["method"]["name"])
+    method = build_method(**cfg["method"])
     expected_in = method.extra_in_channels + 2 * dc["context_slices"] + 1
     if cfg["model"]["in_channels"] != expected_in:
         raise ValueError(f"model.in_channels phải là {expected_in} cho method {cfg['method']['name']}")
-    model = UNetModel(**cfg["model"]).to(device)
+    model = build_model(cfg["model"]).to(device)
     print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M tham số, device {device}", flush=True)
 
     split = load_split(dc["split"]["file"])

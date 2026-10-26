@@ -1,0 +1,2 @@
+# Baseline gốc: UNet 2.5D cổ điển, hồi quy L1 trực tiếp MR -> CT. Mọi tham số lấy từ base.yaml.
+run_name: unet2d_baseline

@@ -1,7 +1,7 @@
 """Đánh giá: val nhanh (lát cố định) trong lúc train, và val/test toàn volume.
 
-    python -X utf8 -m src.eval.evaluate --run outputs/runs/regression_20261016-231500 --ckpt best --split test
-    python -X utf8 -m src.eval.evaluate --run outputs/runs/regression_20261016-231500 --ckpt best --split test --save-nii
+    python -X utf8 -m src.eval.evaluate --run outputs/runs/unet2d_baseline_20261026-120000 --ckpt best --split test
+    python -X utf8 -m src.eval.evaluate --run outputs/runs/unet2d_baseline_20261026-120000 --ckpt best --split test --save-nii
 
 Kết quả: <run>/eval/<split>_<ckpt>/{per_patient,summary}.csv, đồng thời ghi tiếp vào run wandb
 của lần train (bảng eval/<split>_<ckpt>/... và summary <split>_<ckpt>/nfe<n>/<region>/<metric>).
@@ -21,19 +21,19 @@ from ..data.dataset import SliceDataset, build_dataset, load_split
 from ..data.preprocess import parse_id
 from ..inference.predict import predict_volume, save_nifti
 from ..methods import Method, build_method
-from ..models import UNetModel
+from ..models import build_model
 from ..utils.logger import WandbLogger
-from .metrics import all_metrics, mae
+from .metrics import TISSUES, all_metrics, mae
 
-METRICS = ["mae", "psnr", "ssim"]
+METRICS = ["mae", "psnr", "ssim", *(f"mae_{t}" for t in TISSUES)]
 
 
 def load_checkpoint(path, device) -> tuple[torch.nn.Module, Method, dict, dict]:
     ckpt = torch.load(path, map_location="cpu", weights_only=True)
     cfg = ckpt["cfg"]
-    model = UNetModel(**cfg["model"])
+    model = build_model(cfg["model"])
     model.load_state_dict(ckpt["model"])
-    return model.to(device).eval(), build_method(cfg["method"]["name"]), cfg, ckpt
+    return model.to(device).eval(), build_method(**cfg["method"]), cfg, ckpt
 
 
 def val_fast(
@@ -100,7 +100,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     for subset, d in (("all", df), ("no_special", df[~df["special"]])):
         for (nfe, region), g in list(d.groupby(["nfe", "region"])) + [((n, "all"), g) for n, g in d.groupby("nfe")]:
             row = {"subset": subset, "nfe": nfe, "region": region, "n": len(g)}
-            for m in METRICS:
+            for m in (m for m in METRICS if m in g):
                 row[f"{m}_mean"], row[f"{m}_std"] = g[m].mean(), g[m].std()
             parts.append(row)
     return pd.DataFrame(parts).sort_values(["subset", "nfe", "region"]).reset_index(drop=True)
@@ -112,13 +112,14 @@ def summary_metrics(summary: pd.DataFrame, tag: str) -> dict[str, float]:
     for _, r in summary.iterrows():
         prefix = tag if r["subset"] == "all" else f"{tag}_no_special"
         for m in METRICS:
-            out[f"{prefix}/nfe{int(r['nfe'])}/{r['region']}/{m}"] = float(r[f"{m}_mean"])
+            if f"{m}_mean" in r:
+                out[f"{prefix}/nfe{int(r['nfe'])}/{r['region']}/{m}"] = float(r[f"{m}_mean"])
     return out
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--run", required=True, help="thư mục run, vd outputs/runs/regression_20261016-231500")
+    p.add_argument("--run", required=True, help="thư mục run, vd outputs/runs/unet2d_baseline_20261026-120000")
     p.add_argument("--ckpt", default="best", help="best | last | đường dẫn .pt")
     p.add_argument("--split", default="test", choices=["val", "test"])
     p.add_argument("--nfe", type=int, nargs="+", default=None, help="mặc định: inference.nfe trong config")

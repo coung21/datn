@@ -30,26 +30,22 @@ data:
   pin_memory: true
   persistent_workers: true
 
-model:                              # 33.40M tham số
-  image_size: 256
-  in_channels: 4                    # 1 (x_t) + 2*context_slices+1 (MR)
+model:                              # UNet 2.5D cổ điển (src/models/unet2d.py), 31.04M tham số
+  in_channels: 3                    # 2*context_slices+1 lát MR
   out_channels: 1
-  model_channels: 64
-  channel_mult: [1, 2, 2, 4, 4]
-  num_res_blocks: 2
-  attention_resolutions: [32, 16]
-  num_head_channels: 64
-  dropout: 0.1
-  use_scale_shift_norm: true
-  resblock_updown: true
-  time_scale: 1000.0
-  use_checkpoint: false
+  base_channels: 64                 # 64 -> 128 -> 256 -> 512 -> 1024 (đáy)
+  depth: 4                          # số lần giảm kích thước, patch phải chia hết cho 2^depth
+  norm: batch                       # batch | instance | group
+
+method:
+  name: regression
+  loss: l1                          # l1 | l2
 
 train:
   precision: bf16
-  batch_size: 8                     # ~12.8GB / 16GB, batch 12 OOM
-  grad_accum: 4                     # batch hiệu dụng 32
-  total_images: 400000              # -> 12500 optimizer step, ~10 epoch, ~7h compute
+  batch_size: 16                    # BatchNorm cần micro-batch đủ lớn; kiểm tra VRAM bằng scripts/benchmark.py
+  grad_accum: 2                     # batch hiệu dụng 32
+  total_images: 320000              # -> 10000 optimizer step, ~8 epoch (bản cũ 400k)
   optimizer:
     name: adamw
     lr: 2.0e-4
@@ -63,12 +59,12 @@ train:
   ema: null                         # không dùng EMA
   cudnn_benchmark: true
   log_every: 25                     # optimizer step
-  val_every: 1250
-  save_every: 1250
-  val_fast_nfe: [1, 4]
+  val_every: 1000
+  save_every: 1000
+  val_fast_nfe: [1]                 # regression chỉ có NFE 1
   val_full:
     top_k: 2                        # chạy val toàn volume cho 2 checkpoint tốt nhất
-    nfe: 4
+    nfe: 1
 
 inference:
   precision: bf16
@@ -77,7 +73,7 @@ inference:
   blend_mode: gaussian
   pad_value: -1.0
   sw_batch_size: 16
-  nfe: [1, 2, 4, 10, 50]
+  nfe: [1]
 
 logging:
   tqdm: true
@@ -89,7 +85,7 @@ logging:
     tags: []
 
 eval:
-  metrics: [mae, psnr, ssim]
+  metrics: [mae, psnr, ssim, mae_air, mae_fat, mae_soft, mae_marrow, mae_cortical]
   in_mask: true
   hu_range: [-1024, 3000]
   report_without_special: true      # báo cáo thêm khi bỏ các ca có ghi chú
