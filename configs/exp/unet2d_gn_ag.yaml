@@ -1,0 +1,6 @@
+# UNet 2.5D + GroupNorm + attention gate trên skip connection (Attention U-Net, Oktay et al. 2018).
+# So với unet2d_baseline chạy norm=group (MAE test 69.8): chỉ thêm attention gate, còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_ag
+model:
+  norm: group
+  attention_gates: true

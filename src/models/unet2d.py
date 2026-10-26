@@ -2,6 +2,13 @@
 
 Mỗi tầng: 2 x [Conv3x3 -> Norm -> ReLU]. Encoder giảm kích thước bằng MaxPool 2x2,
 decoder tăng bằng ConvTranspose 2x2 rồi nối skip. Đầu ra Conv1x1, không có hàm kích hoạt.
+
+attention_gates=True: mỗi skip đi qua 1 attention gate (Attention U-Net, Oktay et al. 2018)
+trước khi nối với decoder:
+    q = psi^T ReLU(Norm(W_x x) + Norm(W_g g)) + b_psi,   alpha = sigmoid(q),   x_hat = alpha * x
+    h = ConvBlock([g ; x_hat])
+x: đặc trưng skip, g: đặc trưng decoder sau ConvTranspose (cùng độ phân giải với x),
+W_x, W_g, psi là Conv1x1, số kênh trung gian C_int = C / 2.
 """
 
 import torch
@@ -26,9 +33,24 @@ class ConvBlock(nn.Sequential):
         )
 
 
+class AttentionGate(nn.Module):
+    def __init__(self, channels: int, norm: str):
+        super().__init__()
+        inter = channels // 2
+        self.w_x = nn.Sequential(nn.Conv2d(channels, inter, 1, bias=False), make_norm(norm, inter))
+        self.w_g = nn.Sequential(nn.Conv2d(channels, inter, 1, bias=False), make_norm(norm, inter))
+        self.psi = nn.Conv2d(inter, 1, 1)  # có bias b_psi, không norm
+        self.last_alpha: torch.Tensor | None = None  # alpha của lần forward gần nhất, để phân tích
+
+    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        alpha = torch.sigmoid(self.psi(torch.relu(self.w_x(x) + self.w_g(g))))
+        self.last_alpha = alpha.detach()
+        return x * alpha
+
+
 class UNet2D(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 1, base_channels: int = 64, depth: int = 4,
-                 norm: str = "batch"):
+                 norm: str = "batch", attention_gates: bool = False):
         super().__init__()
         self.in_channels, self.depth = in_channels, depth
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
@@ -41,10 +63,11 @@ class UNet2D(nn.Module):
         self.pool = nn.MaxPool2d(2)
         self.bottom = ConvBlock(chs[-2], chs[-1], norm)
 
-        self.up, self.dec = nn.ModuleList(), nn.ModuleList()
+        self.up, self.dec, self.gates = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for ch in reversed(chs[:-1]):
             self.up.append(nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
             self.dec.append(ConvBlock(ch * 2, ch, norm))
+            self.gates.append(AttentionGate(ch, norm) if attention_gates else nn.Identity())
         self.out = nn.Conv2d(chs[0], out_channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -57,6 +80,9 @@ class UNet2D(nn.Module):
             skips.append(x)
             x = self.pool(x)
         x = self.bottom(x)
-        for up, dec, skip in zip(self.up, self.dec, reversed(skips)):
-            x = dec(torch.cat([up(x), skip], dim=1))
+        for up, dec, gate, skip in zip(self.up, self.dec, self.gates, reversed(skips)):
+            g = up(x)
+            if isinstance(gate, AttentionGate):
+                skip = gate(skip, g)
+            x = dec(torch.cat([g, skip], dim=1))
         return self.out(x)

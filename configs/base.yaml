@@ -36,6 +36,7 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   base_channels: 64                 # 64 -> 128 -> 256 -> 512 -> 1024 (đáy)
   depth: 4                          # số lần giảm kích thước, patch phải chia hết cho 2^depth
   norm: batch                       # batch | instance | group
+  attention_gates: false            # true: attention gate trên mỗi skip (Attention U-Net)
 
 method:
   name: regression
