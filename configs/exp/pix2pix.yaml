@@ -1,0 +1,15 @@
+# pix2pix chuẩn (Isola et al. 2017): G = UNet 2.5D + BN (giống unet2d_baseline), D = PatchGAN 70x70.
+# Dữ liệu, lịch LR và số ảnh giữ nguyên base.yaml để so trực tiếp với unet2d_baseline (BN).
+run_name: pix2pix
+method:
+  name: pix2pix
+  gan_mode: vanilla        # BCE như bản gốc | lsgan
+  lambda_l1: 100.0
+  disc:                    # PatchGAN 'basic' 70x70, 2.77M tham số
+    base_channels: 64
+    n_layers: 3
+    norm: batch
+train:
+  optimizer:
+    betas: [0.5, 0.999]    # Adam của pix2pix, dùng cho cả G và D
+  grad_clip: null          # pix2pix không clip (loss G nhân 100 nên clip 1.0 sẽ luôn bị kích hoạt)

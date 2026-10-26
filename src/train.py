@@ -125,9 +125,9 @@ def main():
     total_steps = tc["total_images"] // images_per_step
     oc, sc = tc["optimizer"], tc["lr_schedule"]
     opt = torch.optim.AdamW(model.parameters(), lr=oc["lr"], betas=tuple(oc["betas"]), weight_decay=oc["weight_decay"])
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, cosine_with_warmup(total_steps, sc["warmup_steps"], sc["min_lr"] / oc["lr"])
-    )
+    lr_lambda = cosine_with_warmup(total_steps, sc["warmup_steps"], sc["min_lr"] / oc["lr"])
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    method.setup(cfg, device, lr_lambda)  # mạng/optimizer phụ của method (vd discriminator)
 
     step = 0
     if args.resume:
@@ -137,6 +137,8 @@ def main():
         model.load_state_dict(ckpt["model"])
         opt.load_state_dict(ckpt["optimizer"])
         sched.load_state_dict(ckpt["scheduler"])
+        if ckpt.get("method"):
+            method.load_state_dict(ckpt["method"])
         step = ckpt["step"]
         print(f"Train tiếp từ step {step}", flush=True)
 
@@ -149,6 +151,8 @@ def main():
                mininterval=0.5 if sys.stderr.isatty() else 60)
     data = infinite(loader)
     start, window_start, window_loss, window_steps = time.perf_counter(), time.perf_counter(), 0.0, 0
+    window_parts = {}  # các thành phần loss method trả về (vd l1, g_adv, d của pix2pix)
+    grad_clip = tc["grad_clip"] if tc["grad_clip"] is not None else float("inf")  # null = không clip
 
     while step < total_steps:
         model.train()
@@ -156,15 +160,18 @@ def main():
         for _ in range(tc["grad_accum"]):
             batch = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in next(data).items()}
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                loss, _ = method.loss(model, batch)
+                loss, parts = method.loss(model, batch)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"loss không hữu hạn ở step {step}: {loss.item()}")
             (loss / tc["grad_accum"]).backward()
             step_loss += loss.item() / tc["grad_accum"]
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), tc["grad_clip"])
+            for k, v in parts.items():
+                window_parts[k] = window_parts.get(k, 0.0) + v / tc["grad_accum"]
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
         sched.step()
         opt.zero_grad(set_to_none=True)
+        method.optimizer_step()
         step += 1
         window_loss += step_loss
         window_steps += 1
@@ -177,6 +184,7 @@ def main():
                 "loss": window_loss / window_steps, "grad_norm": float(grad_norm),
                 "img_per_s": window_steps * images_per_step / (now - window_start),
                 "elapsed_h": (now - start) / 3600,
+                **{f"loss_{k}": v / window_steps for k, v in window_parts.items()},
             }
             train_log.log(row)
             wb.log({f"train/{k}": v for k, v in row.items() if k != "step"}, step=step)
@@ -184,13 +192,14 @@ def main():
             if not progress or not sys.stderr.isatty():
                 tqdm.write(f"step {step}/{total_steps} loss {row['loss']:.4f} lr {row['lr']:.2e} "
                            f"gn {row['grad_norm']:.2f} {row['img_per_s']:.1f} img/s {row['elapsed_h']:.2f}h")
-            window_start, window_loss, window_steps = now, 0.0, 0
+            window_start, window_loss, window_steps, window_parts = now, 0.0, 0, {}
 
         if step % tc["save_every"] == 0 or step == total_steps:
             torch.save({"model": model.state_dict(), "step": step, "cfg": cfg},
                        run_dir / "checkpoints" / f"step_{step:06d}.pt")
             torch.save({"model": model.state_dict(), "optimizer": opt.state_dict(),
-                        "scheduler": sched.state_dict(), "step": step, "cfg": cfg}, run_dir / "last.pt")
+                        "scheduler": sched.state_dict(), "method": method.state_dict(), "step": step, "cfg": cfg},
+                       run_dir / "last.pt")
 
         if step % tc["val_every"] == 0 or step == total_steps:
             t0 = time.perf_counter()

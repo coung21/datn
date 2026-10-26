@@ -36,3 +36,18 @@ class Method(ABC):
     def nfe_values(self, requested: list[int]) -> list[int]:
         """Các giá trị NFE có nghĩa với phương pháp này."""
         return list(requested)
+
+    # Hook cho phương pháp có mạng/optimizer riêng ngoài model chính (vd discriminator của GAN).
+    # Mặc định không làm gì, nên regression chạy như cũ.
+    def setup(self, cfg: dict, device: torch.device, lr_lambda) -> None:
+        """Gọi 1 lần trước khi train; lr_lambda là lịch LR dùng chung với model chính."""
+
+    def optimizer_step(self) -> None:
+        """Gọi sau mỗi optimizer step của model chính."""
+
+    def state_dict(self) -> dict:
+        """Trạng thái cần lưu vào last.pt để train tiếp."""
+        return {}
+
+    def load_state_dict(self, state: dict) -> None:
+        pass
