@@ -37,6 +37,8 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   depth: 4                          # số lần giảm kích thước, patch phải chia hết cho 2^depth
   norm: batch                       # batch | instance | group
   attention_gates: false            # true: attention gate trên mỗi skip (Attention U-Net)
+  bottleneck_attention: false       # true: 1 khối self-attention ở bottleneck (16x16 với patch 256)
+  attention_head_channels: 64       # 1024 kênh / 64 = 16 head
 
 method:
   name: regression

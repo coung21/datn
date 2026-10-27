@@ -65,3 +65,40 @@ def test_gn_ag_config():
     assert load_config("configs/base.yaml")["model"]["attention_gates"] is False
     n = sum(p.numel() for p in build_model(cfg["model"]).parameters())
     assert 31e6 < n < 32e6
+
+
+def test_bottleneck_attention_matches_manual_mhsa():
+    """h = x + Proj(softmax(QK^T / sqrt(d)) V), Q/K/V từ GN(x), mỗi head d = 64 kênh."""
+    from src.models.unet2d import SelfAttention2d
+    torch.manual_seed(0)
+    attn = SelfAttention2d(128, 64, "group").eval()
+    x = torch.randn(2, 128, 4, 4)
+    assert torch.equal(attn(x), x)  # Proj khởi tạo 0 -> hàm đồng nhất
+    torch.nn.init.normal_(attn.proj.weight, std=0.05)
+    q, k, v = attn.qkv(attn.norm(x)).reshape(2, 3, 128, 16).unbind(1)  # [B, C, N]
+    heads = []
+    for hd in range(2):
+        sl = slice(64 * hd, 64 * (hd + 1))
+        w = torch.softmax(q[:, sl].transpose(1, 2) @ k[:, sl] / 8.0, dim=-1)  # [B, N, N]
+        heads.append((w @ v[:, sl].transpose(1, 2)).transpose(1, 2))           # [B, 64, N]
+    ref = x + attn.proj(torch.cat(heads, 1).reshape(2, 128, 4, 4))
+    assert torch.allclose(attn(x), ref, atol=1e-5)
+
+
+def test_bottleneck_attention_option():
+    plain = UNet2D(base_channels=8, depth=2, norm="group")
+    model = UNet2D(base_channels=8, depth=2, norm="group", bottleneck_attention=True, attention_head_channels=8)
+    assert all(not k.startswith("bottom_attn") for k in plain.state_dict())
+    assert model.bottom_attn.heads == 4  # 32 kênh bottleneck / 8
+    out = model(torch.randn(2, 3, 32, 32))
+    out.mean().backward()
+    assert out.shape == (2, 1, 32, 32) and model.bottom_attn.proj.weight.grad.abs().sum() > 0
+
+
+def test_gn_ag_mha_config():
+    cfg = load_config("configs/base.yaml", "configs/exp/unet2d_gn_ag_mha.yaml")
+    m = cfg["model"]
+    assert m["norm"] == "group" and m["attention_gates"] and m["bottleneck_attention"]
+    model = build_model(m)
+    assert model.bottom_attn.heads == 16
+    assert 35e6 < sum(p.numel() for p in model.parameters()) < 36e6

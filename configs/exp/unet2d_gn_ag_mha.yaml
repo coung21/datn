@@ -1,0 +1,7 @@
+# UNet 2.5D + GroupNorm + attention gate + self-attention ở bottleneck (16 head x 64 kênh, 1 khối).
+# So với unet2d_gn_ag (MAE test 69.26): chỉ thêm bottleneck attention, còn lại giữ nguyên.
+run_name: unet2d_gn_ag_mha
+model:
+  norm: group
+  attention_gates: true
+  bottleneck_attention: true

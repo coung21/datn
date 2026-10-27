@@ -9,10 +9,16 @@ trước khi nối với decoder:
     h = ConvBlock([g ; x_hat])
 x: đặc trưng skip, g: đặc trưng decoder sau ConvTranspose (cùng độ phân giải với x),
 W_x, W_g, psi là Conv1x1, số kênh trung gian C_int = C / 2.
+
+bottleneck_attention=True: thêm 1 khối self-attention đa đầu sau ConvBlock ở bottleneck (kiểu ADM):
+    h = x + Proj(MHSA(Norm(x)))
+mỗi vị trí 16x16 (patch 256) là 1 token; qkv và Proj là Conv1x1, Proj khởi tạo 0 nên lúc đầu khối là
+hàm đồng nhất. Không positional encoding, không FFN.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def make_norm(kind: str, channels: int) -> nn.Module:
@@ -48,9 +54,30 @@ class AttentionGate(nn.Module):
         return x * alpha
 
 
+class SelfAttention2d(nn.Module):
+    def __init__(self, channels: int, head_channels: int, norm: str):
+        super().__init__()
+        assert channels % head_channels == 0, f"{channels} kênh không chia hết cho {head_channels} kênh/head"
+        self.heads = channels // head_channels
+        self.norm = make_norm(norm, channels)
+        self.qkv = nn.Conv2d(channels, 3 * channels, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        # [B, 3C, H, W] -> 3 x [B, heads, HW, C/heads]
+        q, k, v = self.qkv(self.norm(x)).reshape(b, 3, self.heads, c // self.heads, h * w).permute(1, 0, 2, 4, 3)
+        a = F.scaled_dot_product_attention(q, k, v)  # softmax(QK^T / sqrt(d)) V
+        a = a.permute(0, 1, 3, 2).reshape(b, c, h, w)
+        return x + self.proj(a)
+
+
 class UNet2D(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 1, base_channels: int = 64, depth: int = 4,
-                 norm: str = "batch", attention_gates: bool = False):
+                 norm: str = "batch", attention_gates: bool = False, bottleneck_attention: bool = False,
+                 attention_head_channels: int = 64):
         super().__init__()
         self.in_channels, self.depth = in_channels, depth
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
@@ -62,6 +89,8 @@ class UNet2D(nn.Module):
             prev = ch
         self.pool = nn.MaxPool2d(2)
         self.bottom = ConvBlock(chs[-2], chs[-1], norm)
+        self.bottom_attn = (SelfAttention2d(chs[-1], attention_head_channels, norm) if bottleneck_attention
+                            else nn.Identity())
 
         self.up, self.dec, self.gates = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for ch in reversed(chs[:-1]):
@@ -79,7 +108,7 @@ class UNet2D(nn.Module):
             x = block(x)
             skips.append(x)
             x = self.pool(x)
-        x = self.bottom(x)
+        x = self.bottom_attn(self.bottom(x))
         for up, dec, gate, skip in zip(self.up, self.dec, self.gates, reversed(skips)):
             g = up(x)
             if isinstance(gate, AttentionGate):
