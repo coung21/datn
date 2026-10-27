@@ -10,6 +10,10 @@ trước khi nối với decoder:
 x: đặc trưng skip, g: đặc trưng decoder sau ConvTranspose (cùng độ phân giải với x),
 W_x, W_g, psi là Conv1x1, số kênh trung gian C_int = C / 2.
 
+block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, He et al. 2016), cùng số conv:
+    y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
+shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
+
 bottleneck_attention=True: thêm 1 khối self-attention đa đầu sau ConvBlock ở bottleneck (kiểu ADM):
     h = x + Proj(MHSA(Norm(x)))
 mỗi vị trí 16x16 (patch 256) là 1 token; qkv và Proj là Conv1x1, Proj khởi tạo 0 nên lúc đầu khối là
@@ -37,6 +41,23 @@ class ConvBlock(nn.Sequential):
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False), make_norm(norm, out_ch), nn.ReLU(inplace=True),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False), make_norm(norm, out_ch), nn.ReLU(inplace=True),
         )
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, norm: str):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False), make_norm(norm, out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False), make_norm(norm, out_ch),
+        )
+        self.shortcut = (nn.Identity() if in_ch == out_ch else
+                         nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, bias=False), make_norm(norm, out_ch)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(self.body(x) + self.shortcut(x))
+
+
+BLOCKS = {"conv": ConvBlock, "res": ResBlock}
 
 
 class AttentionGate(nn.Module):
@@ -77,25 +98,28 @@ class SelfAttention2d(nn.Module):
 class UNet2D(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 1, base_channels: int = 64, depth: int = 4,
                  norm: str = "batch", attention_gates: bool = False, bottleneck_attention: bool = False,
-                 attention_head_channels: int = 64):
+                 attention_head_channels: int = 64, block: str = "conv"):
         super().__init__()
+        if block not in BLOCKS:
+            raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
+        Block = BLOCKS[block]
         self.in_channels, self.depth = in_channels, depth
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
 
         self.down = nn.ModuleList()
         prev = in_channels
         for ch in chs[:-1]:
-            self.down.append(ConvBlock(prev, ch, norm))
+            self.down.append(Block(prev, ch, norm))
             prev = ch
         self.pool = nn.MaxPool2d(2)
-        self.bottom = ConvBlock(chs[-2], chs[-1], norm)
+        self.bottom = Block(chs[-2], chs[-1], norm)
         self.bottom_attn = (SelfAttention2d(chs[-1], attention_head_channels, norm) if bottleneck_attention
                             else nn.Identity())
 
         self.up, self.dec, self.gates = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for ch in reversed(chs[:-1]):
             self.up.append(nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
-            self.dec.append(ConvBlock(ch * 2, ch, norm))
+            self.dec.append(Block(ch * 2, ch, norm))
             self.gates.append(AttentionGate(ch, norm) if attention_gates else nn.Identity())
         self.out = nn.Conv2d(chs[0], out_channels, 1)
 

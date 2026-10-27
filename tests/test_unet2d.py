@@ -102,3 +102,35 @@ def test_gn_ag_mha_config():
     model = build_model(m)
     assert model.bottom_attn.heads == 16
     assert 35e6 < sum(p.numel() for p in model.parameters()) < 36e6
+
+
+def test_resblock_formula():
+    """y = ReLU(GN(Conv(ReLU(GN(Conv(x))))) + shortcut(x)); shortcut = x khi cùng số kênh."""
+    from src.models.unet2d import ResBlock
+    torch.manual_seed(0)
+    same, diff = ResBlock(16, 16, "group"), ResBlock(8, 16, "group")
+    assert isinstance(same.shortcut, torch.nn.Identity) and isinstance(diff.shortcut[0], torch.nn.Conv2d)
+    x = torch.randn(2, 16, 8, 8)
+    assert torch.allclose(same(x), torch.relu(same.body(x) + x))
+    x8 = torch.randn(2, 8, 8, 8)
+    assert torch.allclose(diff(x8), torch.relu(diff.body(x8) + diff.shortcut(x8)))
+
+
+def test_res_block_option():
+    conv = UNet2D(base_channels=8, depth=2, norm="group")
+    res = UNet2D(base_channels=8, depth=2, norm="group", block="res", attention_gates=True)
+    # cùng số conv 3x3, chỉ thêm shortcut
+    n3 = lambda m: sum(1 for x in m.modules() if isinstance(x, torch.nn.Conv2d) and x.kernel_size == (3, 3))
+    assert n3(conv) == n3(res)
+    out = res(torch.randn(2, 3, 32, 32))
+    out.mean().backward()
+    assert out.shape == (2, 1, 32, 32) and res.down[0].body[0].weight.grad.abs().sum() > 0
+    with pytest.raises(ValueError):
+        UNet2D(block="dense")
+
+
+def test_gn_ag_res_config():
+    cfg = load_config("configs/base.yaml", "configs/exp/unet2d_gn_ag_res.yaml")
+    m = cfg["model"]
+    assert m["block"] == "res" and m["norm"] == "group" and m["attention_gates"] and not m["bottleneck_attention"]
+    assert load_config("configs/base.yaml")["model"]["block"] == "conv"

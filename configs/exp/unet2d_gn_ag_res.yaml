@@ -1,0 +1,7 @@
+# UNet 2.5D + GroupNorm + attention gate + ResBlock (mỗi ConvBlock thay bằng 1 ResBlock, cùng số conv).
+# So với unet2d_gn_ag (MAE test 69.26): chỉ thêm đường tắt residual, còn lại giữ nguyên.
+run_name: unet2d_gn_ag_res
+model:
+  norm: group
+  attention_gates: true
+  block: res
