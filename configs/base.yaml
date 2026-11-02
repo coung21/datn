@@ -40,10 +40,13 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   attention_gates: false            # true: attention gate trên mỗi skip (Attention U-Net)
   bottleneck_attention: false       # true: 1 khối self-attention ở bottleneck (16x16 với patch 256)
   attention_head_channels: 64       # 1024 kênh / 64 = 16 head
+  structure_guided: false           # SG-gate: gate có thêm bản đồ cấu trúc khí/mô/xương (cần attention_gates)
 
 method:
   name: regression
   loss: l1                          # l1 | l2
+  struct_weight: 0.0                # > 0: thêm loss cấu trúc cho SG-gate (lambda)
+  struct_thresholds: [-400, 200]    # HU: khí < -400, xương > 200
 
 train:
   precision: bf16

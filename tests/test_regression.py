@@ -90,7 +90,7 @@ def test_config(tmp_path):
     cfg = apply_overrides({"a": {"b": 1}}, ["a.b=2.5", "x.y=[1, 2]", "flag=false"])
     assert cfg == {"a": {"b": 2.5}, "x": {"y": [1, 2]}, "flag": False}
     cfg = load_config("configs/base.yaml", "configs/exp/unet2d_baseline.yaml")
-    assert cfg["run_name"] == "unet2d_baseline" and cfg["method"] == {"name": "regression", "loss": "l1"}
+    assert cfg["run_name"] == "unet2d_baseline" and cfg["method"] == {"name": "regression", "loss": "l1", "struct_weight": 0.0, "struct_thresholds": [-400, 200]}
     assert cfg["model"]["in_channels"] == 2 * cfg["data"]["context_slices"] + 1 and cfg["model"]["base_channels"] == 64
 
 
@@ -283,3 +283,38 @@ def test_train_uses_loss_from_config(tiny_run):
     _, run = tiny_run
     first = {loss: pd.read_csv(run(f"method.loss={loss}", f"run_name=loss_{loss}") / "train_log.csv")["loss"].iloc[0] for loss in ("l1", "l2")}
     assert first["l1"] != pytest.approx(first["l2"], rel=1e-3)
+
+
+def test_structure_labels_and_loss():
+    from src.methods.regression import structure_labels, structure_loss
+    import torch.nn.functional as F
+    from src.data.dataset import normalize_ct
+    hu = np.array([[-1000, -401, -399, 0], [199, 201, 1500, -1024]], dtype=np.float32)
+    ct = torch.from_numpy(normalize_ct(hu))[None, None]
+    lab = structure_labels(ct)
+    assert lab[0, 0].tolist() == [[0, 0, 1, 1], [1, 2, 2, 0]]
+    mask = torch.ones_like(ct)
+    perfect = F.one_hot(lab[:, 0], 3).permute(0, 3, 1, 2).float() * 50
+    assert structure_loss(perfect, lab, mask) < 1e-3
+    assert structure_loss(-perfect, lab, mask) > 1.0
+    # logit ở độ phân giải thấp hơn: nhãn và mask được hạ phân giải nearest
+    assert torch.isfinite(structure_loss(torch.randn(1, 3, 1, 2), lab, mask))
+
+
+def test_regression_struct_loss_end_to_end():
+    from src.models import UNet2D
+    torch.manual_seed(0)
+    model = UNet2D(base_channels=8, depth=2, norm="group", attention_gates=True, structure_guided=True)
+    batch = {"cond": torch.randn(2, 3, 16, 16), "ct": torch.rand(2, 1, 16, 16) * 2 - 1, "mask": torch.ones(2, 1, 16, 16)}
+    loss, parts = Regression(struct_weight=0.1).loss(model, batch)
+    assert set(parts) == {"l1", "struct"} and abs(loss.item() - (parts["l1"] + 0.1 * parts["struct"])) < 1e-5
+    loss.backward()
+    assert all(g.w_p.weight.grad.abs().sum() > 0 for g in model.gates) and model.struct_head.weight.grad is not None
+
+
+def test_train_structure_guided(tiny_run):
+    runs, run = tiny_run
+    run_dir = run("model.norm=group", "model.attention_gates=true", "model.structure_guided=true",
+                  "method.struct_weight=0.1", "run_name=tiny_sg")
+    log = pd.read_csv(run_dir / "train_log.csv")
+    assert log["loss_struct"].notna().all() and (log["loss_struct"] > 0).all()

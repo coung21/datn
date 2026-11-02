@@ -1,0 +1,10 @@
+# UNet 2.5D + GroupNorm + structure-guided attention gate (SG-gate).
+# So với unet2d_gn_ag (MAE test 69.26): gate có thêm bản đồ cấu trúc khí / mô mềm / xương dự đoán từ g,
+# được giám sát bằng nhãn ngưỡng HU (loss cấu trúc, lambda = 0.1). Còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_sg
+model:
+  norm: group
+  attention_gates: true
+  structure_guided: true
+method:
+  struct_weight: 0.1

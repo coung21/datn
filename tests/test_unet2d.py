@@ -134,3 +134,35 @@ def test_gn_ag_res_config():
     m = cfg["model"]
     assert m["block"] == "res" and m["norm"] == "group" and m["attention_gates"] and not m["bottleneck_attention"]
     assert load_config("configs/base.yaml")["model"]["block"] == "conv"
+
+
+def test_structure_guided_gate():
+    torch.manual_seed(0)
+    plain = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True)
+    sg = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True, structure_guided=True)
+    extra = sum(p.numel() for p in sg.parameters()) - sum(p.numel() for p in plain.parameters())
+    # mỗi gate: W_p (C*3 + 3) + W_s (3*C/2) + GN (2*C/2); đầu P0: 8*3 + 3
+    assert extra == sum(c * 3 + 3 + 3 * c // 2 + c for c in (8, 16, 32)) + 8 * 3 + 3
+    x = torch.randn(2, 3, 32, 32)
+    out = sg(x)
+    assert out.shape == (2, 1, 32, 32)
+    out2, structs = sg(x, return_struct=True)
+    assert torch.allclose(out, out2)
+    assert [(lv, tuple(lg.shape)) for lv, lg in structs] == [
+        (2, (2, 3, 8, 8)), (1, (2, 3, 16, 16)), (0, (2, 3, 32, 32)), (0, (2, 3, 32, 32))]
+    with pytest.raises(ValueError):
+        UNet2D(attention_gates=False, structure_guided=True)
+    with pytest.raises(AssertionError):
+        plain(x, return_struct=True)
+
+
+def test_structure_guided_gate_formula():
+    from src.models.unet2d import StructureGuidedGate
+    torch.manual_seed(0)
+    gate = StructureGuidedGate(64, "group")
+    x, g = torch.randn(2, 64, 16, 16), torch.randn(2, 64, 16, 16)
+    out = gate(x, g)
+    p = torch.softmax(gate.w_p(g), dim=1)
+    alpha = torch.sigmoid(gate.psi(torch.relu(gate.w_x(x) + gate.w_g(g) + gate.w_s(p))))
+    assert gate.w_s[0].in_channels == 3 and gate.w_s[0].out_channels == 32
+    assert torch.allclose(out, alpha * x, atol=1e-6) and torch.allclose(gate.last_logits, gate.w_p(g))

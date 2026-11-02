@@ -10,6 +10,12 @@ trước khi nối với decoder:
 x: đặc trưng skip, g: đặc trưng decoder sau ConvTranspose (cùng độ phân giải với x),
 W_x, W_g, psi là Conv1x1, số kênh trung gian C_int = C / 2.
 
+structure_guided=True (cần attention_gates=True): đổi mỗi gate thành SG-gate. Gate dự đoán bản đồ cấu trúc
+3 lớp (khí / mô mềm / xương) từ g rồi đưa vào cổng như một nguồn thứ ba:
+    P = softmax(W_p g + b_p),   q = psi^T ReLU(Norm(W_x x) + Norm(W_g g) + Norm(W_s P)) + b_psi
+Thêm 1 đầu P0 (Conv1x1 -> 3 lớp) trên đặc trưng decoder cuối. Logit cấu trúc của mọi tầng được giám sát
+bằng nhãn ngưỡng HU (xem methods/regression.py); khi suy luận chỉ dùng sCT.
+
 block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, He et al. 2016), cùng số conv:
     y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
 shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
@@ -75,6 +81,25 @@ class AttentionGate(nn.Module):
         return x * alpha
 
 
+class StructureGuidedGate(AttentionGate):
+    N_CLASSES = 3  # khí, mô mềm, xương
+
+    def __init__(self, channels: int, norm: str):
+        super().__init__(channels, norm)
+        inter = channels // 2
+        self.w_p = nn.Conv2d(channels, self.N_CLASSES, 1)
+        self.w_s = nn.Sequential(nn.Conv2d(self.N_CLASSES, inter, 1, bias=False), make_norm(norm, inter))
+        self.last_logits: torch.Tensor | None = None  # logit cấu trúc của lần forward gần nhất, để tính loss
+
+    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        logits = self.w_p(g)
+        self.last_logits = logits
+        p = torch.softmax(logits.float(), dim=1).to(g.dtype)
+        alpha = torch.sigmoid(self.psi(torch.relu(self.w_x(x) + self.w_g(g) + self.w_s(p))))
+        self.last_alpha = alpha.detach()
+        return x * alpha
+
+
 class SelfAttention2d(nn.Module):
     def __init__(self, channels: int, head_channels: int, norm: str):
         super().__init__()
@@ -98,11 +123,16 @@ class SelfAttention2d(nn.Module):
 class UNet2D(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 1, base_channels: int = 64, depth: int = 4,
                  norm: str = "batch", attention_gates: bool = False, bottleneck_attention: bool = False,
-                 attention_head_channels: int = 64, block: str = "conv"):
+                 attention_head_channels: int = 64, block: str = "conv",
+                 structure_guided: bool = False):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
+        if structure_guided and not attention_gates:
+            raise ValueError("structure_guided cần attention_gates=True")
         Block = BLOCKS[block]
+        Gate = StructureGuidedGate if structure_guided else AttentionGate
+        self.structure_guided = structure_guided
         self.in_channels, self.depth = in_channels, depth
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
 
@@ -120,10 +150,14 @@ class UNet2D(nn.Module):
         for ch in reversed(chs[:-1]):
             self.up.append(nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
             self.dec.append(Block(ch * 2, ch, norm))
-            self.gates.append(AttentionGate(ch, norm) if attention_gates else nn.Identity())
+            self.gates.append(Gate(ch, norm) if attention_gates else nn.Identity())
         self.out = nn.Conv2d(chs[0], out_channels, 1)
+        if structure_guided:
+            self.struct_head = nn.Conv2d(chs[0], StructureGuidedGate.N_CLASSES, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_struct: bool = False):
+        """return_struct=True (chỉ khi structure_guided): trả thêm list (tầng l, logit cấu trúc).
+        Tầng l có độ phân giải H/2^l; đầu P0 cũng là tầng 0."""
         assert x.shape[1] == self.in_channels, f"Kỳ vọng {self.in_channels} kênh vào, nhận {x.shape[1]}"
         k = 2**self.depth
         assert x.shape[-2] % k == 0 and x.shape[-1] % k == 0, f"H, W phải chia hết cho {k}, nhận {tuple(x.shape[-2:])}"
@@ -138,4 +172,10 @@ class UNet2D(nn.Module):
             if isinstance(gate, AttentionGate):
                 skip = gate(skip, g)
             x = dec(torch.cat([g, skip], dim=1))
-        return self.out(x)
+        out = self.out(x)
+        if not return_struct:
+            return out
+        assert self.structure_guided, "return_struct cần structure_guided=True"
+        n = len(self.gates)
+        structs = [(n - 1 - i, gate.last_logits) for i, gate in enumerate(self.gates)]
+        return out, structs + [(0, self.struct_head(x))]
