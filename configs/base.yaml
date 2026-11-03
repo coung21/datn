@@ -41,6 +41,7 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   bottleneck_attention: false       # true: 1 khối self-attention ở bottleneck (16x16 với patch 256)
   attention_head_channels: 64       # 1024 kênh / 64 = 16 head
   structure_guided: false           # SG-gate: gate có thêm bản đồ cấu trúc khí/mô/xương (cần attention_gates)
+  mixture_head: false               # đầu ra 3 giá trị CT theo lớp mô, trộn theo P0 (cần structure_guided)
 
 method:
   name: regression

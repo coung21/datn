@@ -16,6 +16,11 @@ structure_guided=True (cần attention_gates=True): đổi mỗi gate thành SG-
 Thêm 1 đầu P0 (Conv1x1 -> 3 lớp) trên đặc trưng decoder cuối. Logit cấu trúc của mọi tầng được giám sát
 bằng nhãn ngưỡng HU (xem methods/regression.py); khi suy luận chỉ dùng sCT.
 
+mixture_head=True (cần structure_guided=True): đầu ra Conv1x1 cho 3 giá trị CT, mỗi giá trị cho 1 lớp mô,
+rồi trộn theo bản đồ cấu trúc P0 của đầu struct_head:
+    y = sum_k softmax(P0)_k * y_k,   k in {khí, mô mềm, xương}
+Bias của y_k khởi tạo ở HU điển hình của lớp đó (-1000 / 40 / 700 HU, đổi sang thang [-1, 1]).
+
 block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, He et al. 2016), cùng số conv:
     y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
 shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
@@ -29,6 +34,10 @@ hàm đồng nhất. Không positional encoding, không FFN.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..data.preprocess import CT_CLIP
+
+MIXTURE_INIT_HU = (-1000.0, 40.0, 700.0)  # khí, mô mềm, xương
 
 
 def make_norm(kind: str, channels: int) -> nn.Module:
@@ -124,15 +133,19 @@ class UNet2D(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 1, base_channels: int = 64, depth: int = 4,
                  norm: str = "batch", attention_gates: bool = False, bottleneck_attention: bool = False,
                  attention_head_channels: int = 64, block: str = "conv",
-                 structure_guided: bool = False):
+                 structure_guided: bool = False, mixture_head: bool = False):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
         if structure_guided and not attention_gates:
             raise ValueError("structure_guided cần attention_gates=True")
+        if mixture_head and not structure_guided:
+            raise ValueError("mixture_head cần structure_guided=True")
+        if mixture_head and out_channels != 1:
+            raise ValueError("mixture_head chỉ hỗ trợ out_channels=1")
         Block = BLOCKS[block]
         Gate = StructureGuidedGate if structure_guided else AttentionGate
-        self.structure_guided = structure_guided
+        self.structure_guided, self.mixture_head = structure_guided, mixture_head
         self.in_channels, self.depth = in_channels, depth
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
 
@@ -151,9 +164,14 @@ class UNet2D(nn.Module):
             self.up.append(nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
             self.dec.append(Block(ch * 2, ch, norm))
             self.gates.append(Gate(ch, norm) if attention_gates else nn.Identity())
-        self.out = nn.Conv2d(chs[0], out_channels, 1)
+        n_cls = StructureGuidedGate.N_CLASSES
+        self.out = nn.Conv2d(chs[0], n_cls if mixture_head else out_channels, 1)
+        if mixture_head:
+            lo, hi = CT_CLIP
+            with torch.no_grad():
+                self.out.bias.copy_(torch.tensor([(h - lo) / (hi - lo) * 2 - 1 for h in MIXTURE_INIT_HU]))
         if structure_guided:
-            self.struct_head = nn.Conv2d(chs[0], StructureGuidedGate.N_CLASSES, 1)
+            self.struct_head = nn.Conv2d(chs[0], n_cls, 1)
 
     def forward(self, x: torch.Tensor, return_struct: bool = False):
         """return_struct=True (chỉ khi structure_guided): trả thêm list (tầng l, logit cấu trúc).
@@ -173,9 +191,12 @@ class UNet2D(nn.Module):
                 skip = gate(skip, g)
             x = dec(torch.cat([g, skip], dim=1))
         out = self.out(x)
+        head = self.struct_head(x) if self.structure_guided else None
+        if self.mixture_head:
+            out = (torch.softmax(head.float(), dim=1) * out.float()).sum(dim=1, keepdim=True)
         if not return_struct:
             return out
         assert self.structure_guided, "return_struct cần structure_guided=True"
         n = len(self.gates)
         structs = [(n - 1 - i, gate.last_logits) for i, gate in enumerate(self.gates)]
-        return out, structs + [(0, self.struct_head(x))]
+        return out, structs + [(0, head)]

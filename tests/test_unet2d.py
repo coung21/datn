@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import torch
 
@@ -166,3 +167,32 @@ def test_structure_guided_gate_formula():
     alpha = torch.sigmoid(gate.psi(torch.relu(gate.w_x(x) + gate.w_g(g) + gate.w_s(p))))
     assert gate.w_s[0].in_channels == 3 and gate.w_s[0].out_channels == 32
     assert torch.allclose(out, alpha * x, atol=1e-6) and torch.allclose(gate.last_logits, gate.w_p(g))
+
+
+def test_mixture_head():
+    from src.data.dataset import normalize_ct
+    torch.manual_seed(0)
+    sg = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True, structure_guided=True)
+    mix = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True, structure_guided=True, mixture_head=True)
+    n = lambda m: sum(p.numel() for p in m.parameters())
+    assert n(mix) - n(sg) == 2 * (8 + 1)  # thêm 2 kênh đầu ra của Conv1x1 cuối
+    expect = torch.from_numpy(normalize_ct(np.array([-1000.0, 40.0, 700.0])))
+    assert torch.allclose(mix.out.bias.detach(), expect, atol=1e-6)
+    x = torch.randn(2, 3, 32, 32)
+    out, structs = mix(x, return_struct=True)
+    p0 = torch.softmax(structs[-1][1], dim=1)
+    assert out.shape == (2, 1, 32, 32) and torch.allclose(out, (p0 * mix.out(_last_feature(mix, x))).sum(1, keepdim=True), atol=1e-5)
+    assert torch.allclose(mix(x), out)
+    out.mean().backward()
+    assert mix.struct_head.weight.grad.abs().sum() > 0  # L1 chảy vào P0
+    with pytest.raises(ValueError):
+        UNet2D(attention_gates=True, mixture_head=True)
+
+
+def _last_feature(model, x):
+    """Đặc trưng decoder cuối (đầu vào của model.out)."""
+    feats = {}
+    h = model.out.register_forward_hook(lambda m, i, o: feats.update(x=i[0]))
+    model(x)
+    h.remove()
+    return feats["x"]

@@ -1,0 +1,11 @@
+# UNet 2.5D + GroupNorm + SG-gate + mixture head.
+# So với unet2d_gn_sg (MAE test 69.65): chỉ đổi đầu ra thành 3 giá trị CT (khí / mô mềm / xương)
+# trộn theo bản đồ cấu trúc P0. Loss cấu trúc giữ lambda = 0.1, còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_sg_mix
+model:
+  norm: group
+  attention_gates: true
+  structure_guided: true
+  mixture_head: true
+method:
+  struct_weight: 0.1
