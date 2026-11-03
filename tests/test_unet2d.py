@@ -196,3 +196,34 @@ def _last_feature(model, x):
     model(x)
     h.remove()
     return feats["x"]
+
+
+def test_tissue_film_groupnorm():
+    from src.models.unet2d import TissueFiLMGroupNorm
+    torch.manual_seed(0)
+    film, gn = TissueFiLMGroupNorm(64), torch.nn.GroupNorm(32, 64)
+    x, p = torch.randn(2, 64, 8, 8), torch.softmax(torch.randn(2, 3, 8, 8), dim=1)
+    assert torch.allclose(film(x, p), gn(x), atol=1e-5)  # lúc khởi tạo = GN thường
+    with torch.no_grad():
+        film.gamma.copy_(torch.tensor([1.0, 2.0, 3.0])[:, None].expand(3, 64))
+        film.beta.copy_(torch.tensor([0.0, -1.0, 1.0])[:, None].expand(3, 64))
+    onehot = torch.zeros(1, 3, 8, 8); onehot[:, 2] = 1  # toàn xương
+    assert torch.allclose(film(x[:1], onehot), 3 * gn(x[:1]) + 1, atol=1e-5)
+
+
+def test_tissue_film_unet():
+    torch.manual_seed(0)
+    ag = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True)
+    film = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True, tissue_film=True)
+    n = lambda m: sum(p.numel() for p in m.parameters())
+    # mỗi tầng: Conv1x1 C->3 + 2 lớp GN có 3 cặp gamma/beta thay cho 1 cặp
+    assert n(film) - n(ag) == sum(3 * c + 3 + 2 * (2 * 3 * c - 2 * c) for c in (8, 16, 32))
+    x = torch.randn(2, 3, 32, 32)
+    out, structs = film(x, return_struct=True)
+    assert out.shape == (2, 1, 32, 32) and torch.allclose(film(x), out)
+    assert [(lv, tuple(lg.shape)) for lv, lg in structs] == [(2, (2, 3, 8, 8)), (1, (2, 3, 16, 16)), (0, (2, 3, 32, 32))]
+    out.mean().backward()
+    assert all(m.weight.grad.abs().sum() > 0 for m in film.struct_pred)  # L1 chảy vào P qua FiLM
+    for bad in (dict(norm="batch"), dict(norm="group", block="res"), dict(norm="group", attention_gates=True, structure_guided=True)):
+        with pytest.raises(ValueError):
+            UNet2D(tissue_film=True, **bad)

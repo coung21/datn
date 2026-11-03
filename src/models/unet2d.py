@@ -21,6 +21,12 @@ rồi trộn theo bản đồ cấu trúc P0 của đầu struct_head:
     y = sum_k softmax(P0)_k * y_k,   k in {khí, mô mềm, xương}
 Bias của y_k khởi tạo ở HU điển hình của lớp đó (-1000 / 40 / 700 HU, đổi sang thang [-1, 1]).
 
+tissue_film=True (cần norm="group", không dùng cùng structure_guided): mỗi tầng decoder có 1 nhánh dự đoán
+bản đồ mô P^l = softmax(Conv1x1(g^l)) (khí / mô mềm / xương, giám sát như SG-gate). P^l điều khiển 2 lớp GN
+trong khối conv của tầng đó (FiLM theo mô, kiểu SPADE):
+    GN_P(x)_i = gamma_i * x_hat_i + beta_i,   gamma_i = sum_k P_ik gamma_k,   beta_i = sum_k P_ik beta_k
+gamma_k = 1, beta_k = 0 lúc khởi tạo. Skip connection không dùng P (attention gate thường nếu bật).
+
 block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, He et al. 2016), cùng số conv:
     y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
 shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
@@ -109,6 +115,37 @@ class StructureGuidedGate(AttentionGate):
         return x * alpha
 
 
+class TissueFiLMGroupNorm(nn.Module):
+    """GroupNorm không affine, rồi gamma/beta theo từng voxel = trung bình gamma_k/beta_k theo xác suất mô P."""
+
+    def __init__(self, channels: int, n_classes: int = 3):
+        super().__init__()
+        self.norm = nn.GroupNorm(min(32, channels), channels, affine=False)
+        self.gamma = nn.Parameter(torch.ones(n_classes, channels))
+        self.beta = nn.Parameter(torch.zeros(n_classes, channels))
+
+    def forward(self, x: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        p = p.to(x.dtype)
+        gamma = torch.einsum("bkhw,kc->bchw", p, self.gamma.to(x.dtype))
+        beta = torch.einsum("bkhw,kc->bchw", p, self.beta.to(x.dtype))
+        return gamma * self.norm(x) + beta
+
+
+class TissueFiLMConvBlock(nn.Module):
+    """2 x [Conv3x3 -> GN điều khiển bởi P -> ReLU]."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.norm1 = TissueFiLMGroupNorm(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.norm2 = TissueFiLMGroupNorm(out_ch)
+
+    def forward(self, x: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+        x = torch.relu(self.norm1(self.conv1(x), p))
+        return torch.relu(self.norm2(self.conv2(x), p))
+
+
 class SelfAttention2d(nn.Module):
     def __init__(self, channels: int, head_channels: int, norm: str):
         super().__init__()
@@ -133,19 +170,21 @@ class UNet2D(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 1, base_channels: int = 64, depth: int = 4,
                  norm: str = "batch", attention_gates: bool = False, bottleneck_attention: bool = False,
                  attention_head_channels: int = 64, block: str = "conv",
-                 structure_guided: bool = False, mixture_head: bool = False):
+                 structure_guided: bool = False, mixture_head: bool = False, tissue_film: bool = False):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
         if structure_guided and not attention_gates:
             raise ValueError("structure_guided cần attention_gates=True")
+        if tissue_film and (norm != "group" or block != "conv" or structure_guided):
+            raise ValueError("tissue_film cần norm=group, block=conv và structure_guided=False")
         if mixture_head and not structure_guided:
             raise ValueError("mixture_head cần structure_guided=True")
         if mixture_head and out_channels != 1:
             raise ValueError("mixture_head chỉ hỗ trợ out_channels=1")
         Block = BLOCKS[block]
         Gate = StructureGuidedGate if structure_guided else AttentionGate
-        self.structure_guided, self.mixture_head = structure_guided, mixture_head
+        self.structure_guided, self.mixture_head, self.tissue_film = structure_guided, mixture_head, tissue_film
         self.in_channels, self.depth = in_channels, depth
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
 
@@ -162,9 +201,11 @@ class UNet2D(nn.Module):
         self.up, self.dec, self.gates = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for ch in reversed(chs[:-1]):
             self.up.append(nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
-            self.dec.append(Block(ch * 2, ch, norm))
+            self.dec.append(TissueFiLMConvBlock(ch * 2, ch) if tissue_film else Block(ch * 2, ch, norm))
             self.gates.append(Gate(ch, norm) if attention_gates else nn.Identity())
         n_cls = StructureGuidedGate.N_CLASSES
+        if tissue_film:
+            self.struct_pred = nn.ModuleList(nn.Conv2d(ch, n_cls, 1) for ch in reversed(chs[:-1]))
         self.out = nn.Conv2d(chs[0], n_cls if mixture_head else out_channels, 1)
         if mixture_head:
             lo, hi = CT_CLIP
@@ -174,8 +215,8 @@ class UNet2D(nn.Module):
             self.struct_head = nn.Conv2d(chs[0], n_cls, 1)
 
     def forward(self, x: torch.Tensor, return_struct: bool = False):
-        """return_struct=True (chỉ khi structure_guided): trả thêm list (tầng l, logit cấu trúc).
-        Tầng l có độ phân giải H/2^l; đầu P0 cũng là tầng 0."""
+        """return_struct=True (structure_guided hoặc tissue_film): trả thêm list (tầng l, logit cấu trúc).
+        Tầng l có độ phân giải H/2^l; đầu P0 của structure_guided cũng là tầng 0."""
         assert x.shape[1] == self.in_channels, f"Kỳ vọng {self.in_channels} kênh vào, nhận {x.shape[1]}"
         k = 2**self.depth
         assert x.shape[-2] % k == 0 and x.shape[-1] % k == 0, f"H, W phải chia hết cho {k}, nhận {tuple(x.shape[-2:])}"
@@ -185,18 +226,27 @@ class UNet2D(nn.Module):
             skips.append(x)
             x = self.pool(x)
         x = self.bottom_attn(self.bottom(x))
-        for up, dec, gate, skip in zip(self.up, self.dec, self.gates, reversed(skips)):
+        film_logits = []
+        for i, (up, dec, gate, skip) in enumerate(zip(self.up, self.dec, self.gates, reversed(skips))):
             g = up(x)
             if isinstance(gate, AttentionGate):
                 skip = gate(skip, g)
-            x = dec(torch.cat([g, skip], dim=1))
+            h = torch.cat([g, skip], dim=1)
+            if self.tissue_film:
+                logits = self.struct_pred[i](g)
+                film_logits.append((len(self.up) - 1 - i, logits))
+                x = dec(h, torch.softmax(logits.float(), dim=1))
+            else:
+                x = dec(h)
         out = self.out(x)
         head = self.struct_head(x) if self.structure_guided else None
         if self.mixture_head:
             out = (torch.softmax(head.float(), dim=1) * out.float()).sum(dim=1, keepdim=True)
         if not return_struct:
             return out
-        assert self.structure_guided, "return_struct cần structure_guided=True"
+        if self.tissue_film:
+            return out, film_logits
+        assert self.structure_guided, "return_struct cần structure_guided hoặc tissue_film"
         n = len(self.gates)
         structs = [(n - 1 - i, gate.last_logits) for i, gate in enumerate(self.gates)]
         return out, structs + [(0, head)]

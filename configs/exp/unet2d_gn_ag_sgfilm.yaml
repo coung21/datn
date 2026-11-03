@@ -1,0 +1,11 @@
+# UNet 2.5D + GroupNorm + attention gate + FiLM theo mô.
+# So với unet2d_gn_ag (MAE test 69.26): mỗi tầng decoder dự đoán bản đồ khí / mô mềm / xương P^l từ g^l
+# (giám sát bằng nhãn ngưỡng HU, lambda = 0.1); P^l điều khiển gamma/beta của 2 lớp GN trong khối conv decoder.
+# Attention gate trên skip vẫn là gate thường, không dùng P. Còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_ag_sgfilm
+model:
+  norm: group
+  attention_gates: true
+  tissue_film: true
+method:
+  struct_weight: 0.1

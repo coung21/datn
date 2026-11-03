@@ -326,3 +326,10 @@ def test_train_mixture_head(tiny_run):
                   "model.mixture_head=true", "method.struct_weight=0.1", "run_name=tiny_mix")
     assert pd.read_csv(run_dir / "train_log.csv")["loss_struct"].notna().all()
     assert (run_dir / "eval").exists() or (run_dir / "val_full.csv").exists()
+
+
+def test_train_tissue_film(tiny_run):
+    runs, run = tiny_run
+    run_dir = run("model.norm=group", "model.attention_gates=true", "model.tissue_film=true",
+                  "method.struct_weight=0.1", "run_name=tiny_film")
+    assert pd.read_csv(run_dir / "train_log.csv")["loss_struct"].notna().all()

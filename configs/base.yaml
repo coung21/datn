@@ -42,6 +42,7 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   attention_head_channels: 64       # 1024 kênh / 64 = 16 head
   structure_guided: false           # SG-gate: gate có thêm bản đồ cấu trúc khí/mô/xương (cần attention_gates)
   mixture_head: false               # đầu ra 3 giá trị CT theo lớp mô, trộn theo P0 (cần structure_guided)
+  tissue_film: false                # bản đồ mô dự đoán ở mỗi tầng decoder điều khiển GN (FiLM theo mô)
 
 method:
   name: regression
