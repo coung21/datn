@@ -1,0 +1,8 @@
+# UNet 2.5D + GroupNorm + attention gate + multi-scale input (khối dilation 1/2/4/8 kiểu ASPP).
+# So với unet2d_gn_ag (MAE test 69.26): thêm khối trích đặc trưng đa quy mô trên MRI, AvgPool về từng tầng rồi
+# cộng (Conv1x1 khởi tạo 0) vào đầu vào khối conv encoder tầng 1-3 và bottleneck. Còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_ag_ms
+model:
+  norm: group
+  attention_gates: true
+  multiscale_input: true

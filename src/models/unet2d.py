@@ -27,6 +27,13 @@ trong khối conv của tầng đó (FiLM theo mô, kiểu SPADE):
     GN_P(x)_i = gamma_i * x_hat_i + beta_i,   gamma_i = sum_k P_ik gamma_k,   beta_i = sum_k P_ik beta_k
 gamma_k = 1, beta_k = 0 lúc khởi tạo. Skip connection không dùng P (attention gate thường nếu bật).
 
+multiscale_input=True: thêm khối trích đặc trưng đa quy mô trên MRI (kiểu ASPP, giữ độ phân giải đầy đủ):
+    F = ReLU(GN(Conv1x1([ReLU(GN(Conv3x3_d(MR))) for d in dilations])))
+F được AvgPool về kích thước tầng s rồi chiếu Conv1x1 (khởi tạo 0) và cộng vào đầu vào khối conv của
+tầng encoder s = 1..depth-1 và bottleneck:
+    e_s = Block_s(MaxPool(e_{s-1}) + Proj_s(AvgPool_{2^s}(F)))
+Tầng 0 vẫn nhận MRI bình thường. Lúc khởi tạo model giống hệt khi không bật.
+
 block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, He et al. 2016), cùng số conv:
     y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
 shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
@@ -146,6 +153,22 @@ class TissueFiLMConvBlock(nn.Module):
         return torch.relu(self.norm2(self.conv2(x), p))
 
 
+class MultiScaleExtractor(nn.Module):
+    """Các nhánh Conv3x3 với dilation khác nhau chạy song song trên MRI, ghép kênh rồi trộn bằng Conv1x1."""
+
+    def __init__(self, in_ch: int, branch_ch: int, out_ch: int, dilations=(1, 2, 4, 8)):
+        super().__init__()
+        self.branches = nn.ModuleList(
+            nn.Sequential(nn.Conv2d(in_ch, branch_ch, 3, padding=d, dilation=d, bias=False),
+                          nn.GroupNorm(min(8, branch_ch), branch_ch), nn.ReLU(inplace=True))
+            for d in dilations)
+        cat = branch_ch * len(dilations)
+        self.fuse = nn.Sequential(nn.Conv2d(cat, out_ch, 1, bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fuse(torch.cat([b(x) for b in self.branches], dim=1))
+
+
 class SelfAttention2d(nn.Module):
     def __init__(self, channels: int, head_channels: int, norm: str):
         super().__init__()
@@ -170,7 +193,9 @@ class UNet2D(nn.Module):
     def __init__(self, in_channels: int = 3, out_channels: int = 1, base_channels: int = 64, depth: int = 4,
                  norm: str = "batch", attention_gates: bool = False, bottleneck_attention: bool = False,
                  attention_head_channels: int = 64, block: str = "conv",
-                 structure_guided: bool = False, mixture_head: bool = False, tissue_film: bool = False):
+                 structure_guided: bool = False, mixture_head: bool = False, tissue_film: bool = False,
+                 multiscale_input: bool = False, multiscale_branch_channels: int = 16,
+                 multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8)):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -194,6 +219,15 @@ class UNet2D(nn.Module):
             self.down.append(Block(prev, ch, norm))
             prev = ch
         self.pool = nn.MaxPool2d(2)
+        self.multiscale_input = multiscale_input
+        if multiscale_input:
+            self.ms_extract = MultiScaleExtractor(in_channels, multiscale_branch_channels, multiscale_channels,
+                                                  tuple(multiscale_dilations))
+            # đầu vào khối conv tầng 1..depth-1 và bottleneck có số kênh chs[0..depth-1]
+            self.ms_proj = nn.ModuleList(nn.Conv2d(multiscale_channels, ch, 1) for ch in chs[:-1])
+            for proj in self.ms_proj:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
         self.bottom = Block(chs[-2], chs[-1], norm)
         self.bottom_attn = (SelfAttention2d(chs[-1], attention_head_channels, norm) if bottleneck_attention
                             else nn.Identity())
@@ -220,11 +254,16 @@ class UNet2D(nn.Module):
         assert x.shape[1] == self.in_channels, f"Kỳ vọng {self.in_channels} kênh vào, nhận {x.shape[1]}"
         k = 2**self.depth
         assert x.shape[-2] % k == 0 and x.shape[-1] % k == 0, f"H, W phải chia hết cho {k}, nhận {tuple(x.shape[-2:])}"
+        feat = self.ms_extract(x) if self.multiscale_input else None
         skips = []
-        for block in self.down:
+        for s, block in enumerate(self.down):
+            if feat is not None and s > 0:
+                x = x + self.ms_proj[s - 1](F.avg_pool2d(feat, 2**s))
             x = block(x)
             skips.append(x)
             x = self.pool(x)
+        if feat is not None:
+            x = x + self.ms_proj[-1](F.avg_pool2d(feat, 2**self.depth))
         x = self.bottom_attn(self.bottom(x))
         film_logits = []
         for i, (up, dec, gate, skip) in enumerate(zip(self.up, self.dec, self.gates, reversed(skips))):

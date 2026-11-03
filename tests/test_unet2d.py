@@ -227,3 +227,20 @@ def test_tissue_film_unet():
     for bad in (dict(norm="batch"), dict(norm="group", block="res"), dict(norm="group", attention_gates=True, structure_guided=True)):
         with pytest.raises(ValueError):
             UNet2D(tissue_film=True, **bad)
+
+
+def test_multiscale_input():
+    torch.manual_seed(0)
+    ag = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True)
+    ms = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True, multiscale_input=True,
+                multiscale_branch_channels=4, multiscale_channels=8)
+    # Proj khởi tạo 0: cùng trọng số phần chung thì đầu ra giống hệt model không bật
+    missing = ms.load_state_dict(ag.state_dict(), strict=False).missing_keys
+    assert missing and all(k.startswith(("ms_extract", "ms_proj")) for k in missing)
+    x = torch.randn(2, 3, 32, 32)
+    assert torch.allclose(ms(x), ag(x), atol=1e-6)
+    assert [p.out_channels for p in ms.ms_proj] == [8, 16, 32]
+    assert [b[0].dilation for b in ms.ms_extract.branches] == [(1, 1), (2, 2), (4, 4), (8, 8)]
+    out = ms(x)
+    out.mean().backward()
+    assert all(p.weight.grad.abs().sum() > 0 for p in ms.ms_proj)
