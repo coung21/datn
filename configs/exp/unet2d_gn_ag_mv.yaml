@@ -1,0 +1,12 @@
+# UNet 2.5D + GroupNorm + attention gate + multi-view input.
+# So với unet2d_gn_ag (MAE test 69.26): đầu vào khối 9 lát MR (context_slices 4). UNet chính vẫn nhận 3 lát giữa;
+# khối 9 lát đi qua nhánh conv 3D dẹt axial (1x3x3) / coronal (3x1x3) / sagittal (3x3x1), trộn, gộp trục z, rồi cộng
+# (Conv1x1 khởi tạo 0) vào đầu vào khối conv encoder tầng 1-3 và bottleneck. Còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_ag_mv
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true

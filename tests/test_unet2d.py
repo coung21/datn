@@ -302,3 +302,29 @@ def test_region_adagn():
     for bad in (dict(norm="batch"), dict(norm="group", block="res"), dict(norm="group", region_film=True)):
         with pytest.raises(ValueError):
             UNet2D(region_adagn=True, **bad)
+
+
+def test_multiview_input():
+    torch.manual_seed(0)
+    ag = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True)
+    mv = UNet2D(in_channels=9, base_channels=8, depth=3, norm="group", attention_gates=True, multiview_input=True,
+                multiview_branch_channels=4, multiview_channels=8)
+    # Proj khởi tạo 0: cùng trọng số phần chung thì đầu ra giống UNet chỉ nhận 3 lát giữa
+    missing = mv.load_state_dict(ag.state_dict(), strict=False).missing_keys
+    assert missing and all(k.startswith(("mv_extract", "mv_proj")) for k in missing)
+    x = torch.randn(2, 9, 32, 32)
+    assert torch.allclose(mv(x), ag(x[:, 3:6]), atol=1e-6)
+    ext = mv.mv_extract
+    assert [b[0].kernel_size for b in ext.branches.values()] == [(1, 3, 3), (3, 1, 3), (3, 3, 1)]
+    assert ext(x).shape == (2, 8, 32, 32)
+    # nhánh nhìn được lát ngoài 3 lát giữa: đổi lát 0 thì F đổi
+    x2 = x.clone()
+    x2[:, 0] += 1
+    assert not torch.allclose(ext(x), ext(x2))
+    out = mv(x)
+    out.mean().backward()
+    assert all(p.weight.grad.abs().sum() > 0 for p in mv.mv_proj)
+    for bad in (dict(multiscale_input=True), dict(main_in_channels=2), dict(main_in_channels=11), dict(in_channels=8)):
+        kw = dict(in_channels=9, norm="group", multiview_input=True) | bad
+        with pytest.raises(ValueError):
+            UNet2D(**kw)

@@ -34,6 +34,13 @@ tầng encoder s = 1..depth-1 và bottleneck:
     e_s = Block_s(MaxPool(e_{s-1}) + Proj_s(AvgPool_{2^s}(F)))
 Tầng 0 vẫn nhận MRI bình thường. Lúc khởi tạo model giống hệt khi không bật.
 
+multiview_input=True (không dùng cùng multiscale_input): đầu vào là khối K lát MR (in_channels = K). UNet chính chỉ
+nhận main_in_channels lát giữa; khối K lát đi qua nhánh multi-view 3D nhẹ, mỗi nhánh 1 mặt cắt:
+    axial: Conv3d (1x3x3),  coronal: Conv3d (3x1x3),  sagittal: Conv3d (3x3x1)   (2 lớp, mỗi lớp -> GN -> ReLU)
+    F = ReLU(GN(Conv3d_(K,1,1)(ReLU(GN(Conv1x1x1([axial; coronal; sagittal]))))))     (gộp trục z về lát giữa)
+F (multiview_channels kênh, độ phân giải đầy đủ) được đưa vào encoder giống multiscale_input (AvgPool, Conv1x1 khởi
+tạo 0, cộng vào đầu vào khối conv tầng 1..depth-1 và bottleneck). Lúc khởi tạo model giống UNet chỉ nhận lát giữa.
+
 region_film=True (cần norm="group"): điều kiện hóa theo vùng giải phẫu (0 não, 1 chậu). Mọi GN trong các khối
 conv của encoder, bottleneck và decoder có gamma/beta riêng cho từng vùng:
     GN_r(x) = gamma_r * x_hat + beta_r
@@ -231,6 +238,29 @@ class MultiScaleExtractor(nn.Module):
         return self.fuse(torch.cat([b(x) for b in self.branches], dim=1))
 
 
+class MultiViewExtractor(nn.Module):
+    """Nhánh conv 3D dẹt theo 3 mặt cắt trên khối K lát MR, trộn rồi gộp trục z -> đặc trưng 2D của lát giữa."""
+
+    KERNELS = {"axial": (1, 3, 3), "coronal": (3, 1, 3), "sagittal": (3, 3, 1)}
+
+    def __init__(self, n_slices: int, branch_ch: int, out_ch: int):
+        super().__init__()
+
+        def conv(i, o, k):
+            return [nn.Conv3d(i, o, k, padding=tuple(s // 2 for s in k), bias=False),
+                    nn.GroupNorm(min(8, o), o), nn.ReLU(inplace=True)]
+
+        self.branches = nn.ModuleDict(
+            {name: nn.Sequential(*conv(1, branch_ch, k), *conv(branch_ch, branch_ch, k)) for name, k in self.KERNELS.items()})
+        self.fuse = nn.Sequential(
+            nn.Conv3d(3 * branch_ch, out_ch, 1, bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, (n_slices, 1, 1), bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        v = x.unsqueeze(1)  # [B, 1, K, H, W]
+        return self.fuse(torch.cat([b(v) for b in self.branches.values()], dim=1)).squeeze(2)
+
+
 class SelfAttention2d(nn.Module):
     def __init__(self, channels: int, head_channels: int, norm: str):
         super().__init__()
@@ -258,7 +288,9 @@ class UNet2D(nn.Module):
                  structure_guided: bool = False, mixture_head: bool = False, tissue_film: bool = False,
                  multiscale_input: bool = False, multiscale_branch_channels: int = 16,
                  multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8), region_film: bool = False,
-                 region_adagn: bool = False, region_emb_channels: int = 256):
+                 region_adagn: bool = False, region_emb_channels: int = 256,
+                 multiview_input: bool = False, main_in_channels: int = 3, multiview_branch_channels: int = 16,
+                 multiview_channels: int = 64):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -270,6 +302,10 @@ class UNet2D(nn.Module):
             raise ValueError("region_film cần norm=group và tissue_film=False")
         if region_adagn and (norm != "group" or block != "conv" or tissue_film or region_film):
             raise ValueError("region_adagn cần norm=group, block=conv, tissue_film=False và region_film=False")
+        if multiview_input and (multiscale_input or main_in_channels % 2 == 0 or not 0 < main_in_channels <= in_channels
+                                or in_channels % 2 == 0):
+            raise ValueError("multiview_input cần multiscale_input=False, in_channels và main_in_channels lẻ, "
+                             "main_in_channels <= in_channels")
         if mixture_head and not structure_guided:
             raise ValueError("mixture_head cần structure_guided=True")
         if mixture_head and out_channels != 1:
@@ -288,7 +324,11 @@ class UNet2D(nn.Module):
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
 
         self.down = nn.ModuleList()
-        prev = in_channels
+        self.multiview_input = multiview_input
+        # multiview_input: UNet chính chỉ nhận main_in_channels lát giữa của khối in_channels lát
+        self.main_slice = (slice((in_channels - main_in_channels) // 2, (in_channels + main_in_channels) // 2)
+                           if multiview_input else slice(None))
+        prev = main_in_channels if multiview_input else in_channels
         for ch in chs[:-1]:
             self.down.append(Block(prev, ch, block_norm))
             prev = ch
@@ -300,6 +340,12 @@ class UNet2D(nn.Module):
             # đầu vào khối conv tầng 1..depth-1 và bottleneck có số kênh chs[0..depth-1]
             self.ms_proj = nn.ModuleList(nn.Conv2d(multiscale_channels, ch, 1) for ch in chs[:-1])
             for proj in self.ms_proj:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+        if multiview_input:
+            self.mv_extract = MultiViewExtractor(in_channels, multiview_branch_channels, multiview_channels)
+            self.mv_proj = nn.ModuleList(nn.Conv2d(multiview_channels, ch, 1) for ch in chs[:-1])
+            for proj in self.mv_proj:
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
         self.bottom = Block(chs[-2], chs[-1], block_norm)
@@ -338,16 +384,21 @@ class UNet2D(nn.Module):
                     m.emb = emb
         k = 2**self.depth
         assert x.shape[-2] % k == 0 and x.shape[-1] % k == 0, f"H, W phải chia hết cho {k}, nhận {tuple(x.shape[-2:])}"
-        feat = self.ms_extract(x) if self.multiscale_input else None
+        feat, proj = None, None
+        if self.multiscale_input:
+            feat, proj = self.ms_extract(x), self.ms_proj
+        elif self.multiview_input:
+            feat, proj = self.mv_extract(x), self.mv_proj
+            x = x[:, self.main_slice]
         skips = []
         for s, block in enumerate(self.down):
             if feat is not None and s > 0:
-                x = x + self.ms_proj[s - 1](F.avg_pool2d(feat, 2**s))
+                x = x + proj[s - 1](F.avg_pool2d(feat, 2**s))
             x = block(x)
             skips.append(x)
             x = self.pool(x)
         if feat is not None:
-            x = x + self.ms_proj[-1](F.avg_pool2d(feat, 2**self.depth))
+            x = x + proj[-1](F.avg_pool2d(feat, 2**self.depth))
         x = self.bottom_attn(self.bottom(x))
         film_logits = []
         for i, (up, dec, gate, skip) in enumerate(zip(self.up, self.dec, self.gates, reversed(skips))):

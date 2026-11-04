@@ -348,3 +348,12 @@ def test_train_region_adagn(tiny_run):
                   "model.region_emb_channels=16", "run_name=tiny_radagn")
     assert pd.read_csv(run_dir / "train_log.csv")["loss"].notna().all()
     assert (run_dir / "val_full.csv").exists()
+
+
+def test_train_multiview_input(tiny_run):
+    runs, run = tiny_run
+    run_dir = run("data.context_slices=2", "model.in_channels=5", "model.norm=group", "model.attention_gates=true",
+                  "model.multiview_input=true", "model.multiview_branch_channels=4", "model.multiview_channels=8",
+                  "run_name=tiny_mv")
+    assert pd.read_csv(run_dir / "train_log.csv")["loss"].notna().all()
+    assert (run_dir / "val_full.csv").exists()

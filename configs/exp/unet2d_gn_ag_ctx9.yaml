@@ -1,0 +1,9 @@
+# Đối chứng cho unet2d_gn_ag_mv: UNet 2.5D + GroupNorm + attention gate nhận thẳng 9 lát MR làm 9 kênh vào
+# (context_slices 4), không có nhánh multi-view. Còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_ag_ctx9
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true

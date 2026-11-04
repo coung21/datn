@@ -50,6 +50,10 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   region_film: false                # GN trong khối conv có gamma/beta riêng cho não / chậu
   region_adagn: false               # AdaGN theo vùng (kiểu ADM) ở GN thứ 2 mỗi khối conv
   region_emb_channels: 256          # số kênh embedding vùng của region_adagn
+  multiview_input: false            # nhánh conv 3D dẹt theo 3 mặt cắt trên khối in_channels lát, cộng vào encoder
+  main_in_channels: 3               # số lát giữa UNet chính nhận khi multiview_input
+  multiview_branch_channels: 16     # số kênh mỗi nhánh mặt cắt
+  multiview_channels: 64            # số kênh F sau khi trộn
 
 method:
   name: regression
