@@ -39,6 +39,12 @@ conv của encoder, bottleneck và decoder có gamma/beta riêng cho từng vùn
     GN_r(x) = gamma_r * x_hat + beta_r
 gamma_r = 1, beta_r = 0 lúc khởi tạo. Attention gate và phần còn lại dùng chung. forward cần region.
 
+region_adagn=True (cần norm="group", block="conv"): điều kiện hóa theo vùng kiểu AdaGN của ADM. Nhãn vùng qua
+embedding dùng chung e = Linear(SiLU(Linear(Embedding(r)))); GN thứ 2 trong mỗi khối conv của encoder,
+bottleneck và decoder thành
+    AdaGN(h) = GN(h) * (1 + scale) + shift,   (scale, shift) = Linear(SiLU(e))   (Linear riêng mỗi khối, khởi tạo 0)
+nên lúc khởi tạo model giống hệt khi không bật. Attention gate dùng chung. forward cần region.
+
 block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, He et al. 2016), cùng số conv:
     y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
 shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
@@ -164,6 +170,36 @@ class RegionFiLMGroupNorm(nn.Module):
         return gamma * self.norm(x) + beta
 
 
+class AdaGroupNorm(nn.Module):
+    """GN(h) * (1 + scale) + shift, (scale, shift) chiếu từ embedding vùng (ADM AdaGN, use_scale_shift_norm).
+
+    Embedding [B, E] do UNet2D gán vào thuộc tính `emb` ngay trước mỗi lần forward."""
+
+    def __init__(self, channels: int, emb_channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(min(32, channels), channels)
+        self.proj = nn.Sequential(nn.SiLU(), nn.Linear(emb_channels, 2 * channels))
+        nn.init.zeros_(self.proj[1].weight)
+        nn.init.zeros_(self.proj[1].bias)
+        self.emb: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert self.emb is not None, "AdaGroupNorm cần embedding vùng (gọi qua UNet2D với region=...)"
+        scale, shift = self.proj(self.emb).to(x.dtype)[:, :, None, None].chunk(2, dim=1)
+        return self.norm(x) * (1 + scale) + shift
+
+
+class AdaGNConvBlock(nn.Sequential):
+    """Conv3x3 -> GN -> ReLU -> Conv3x3 -> AdaGN(vùng) -> ReLU."""
+
+    def __init__(self, in_ch: int, out_ch: int, emb_channels: int):
+        super().__init__(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False), AdaGroupNorm(out_ch, emb_channels),
+            nn.ReLU(inplace=True),
+        )
+
+
 class TissueFiLMConvBlock(nn.Module):
     """2 x [Conv3x3 -> GN điều khiển bởi P -> ReLU]."""
 
@@ -221,7 +257,8 @@ class UNet2D(nn.Module):
                  attention_head_channels: int = 64, block: str = "conv",
                  structure_guided: bool = False, mixture_head: bool = False, tissue_film: bool = False,
                  multiscale_input: bool = False, multiscale_branch_channels: int = 16,
-                 multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8), region_film: bool = False):
+                 multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8), region_film: bool = False,
+                 region_adagn: bool = False, region_emb_channels: int = 256):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -231,15 +268,22 @@ class UNet2D(nn.Module):
             raise ValueError("tissue_film cần norm=group, block=conv và structure_guided=False")
         if region_film and (norm != "group" or tissue_film):
             raise ValueError("region_film cần norm=group và tissue_film=False")
+        if region_adagn and (norm != "group" or block != "conv" or tissue_film or region_film):
+            raise ValueError("region_adagn cần norm=group, block=conv, tissue_film=False và region_film=False")
         if mixture_head and not structure_guided:
             raise ValueError("mixture_head cần structure_guided=True")
         if mixture_head and out_channels != 1:
             raise ValueError("mixture_head chỉ hỗ trợ out_channels=1")
         Block = BLOCKS[block]
+        if region_adagn:
+            Block = lambda i, o, _norm: AdaGNConvBlock(i, o, region_emb_channels)  # noqa: E731
+            e = region_emb_channels
+            self.region_emb = nn.Sequential(nn.Embedding(2, e), nn.Linear(e, e), nn.SiLU(), nn.Linear(e, e))
         Gate = StructureGuidedGate if structure_guided else AttentionGate
         self.structure_guided, self.mixture_head, self.tissue_film = structure_guided, mixture_head, tissue_film
         self.in_channels, self.depth = in_channels, depth
-        self.region_film = region_film
+        self.region_film, self.region_adagn = region_film, region_adagn
+        self.needs_region = region_film or region_adagn
         block_norm = "region_group" if region_film else norm  # chỉ GN trong các khối conv đổi theo vùng
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
 
@@ -281,14 +325,17 @@ class UNet2D(nn.Module):
     def forward(self, x: torch.Tensor, return_struct: bool = False, region=None):
         """return_struct=True (structure_guided hoặc tissue_film): trả thêm list (tầng l, logit cấu trúc).
         Tầng l có độ phân giải H/2^l; đầu P0 của structure_guided cũng là tầng 0.
-        region (region_film): int chung cho cả batch hoặc tensor [B], 0 não, 1 chậu."""
+        region (region_film / region_adagn): int chung cho cả batch hoặc tensor [B], 0 não, 1 chậu."""
         assert x.shape[1] == self.in_channels, f"Kỳ vọng {self.in_channels} kênh vào, nhận {x.shape[1]}"
-        if self.region_film:
-            assert region is not None, "region_film cần region"
+        if self.needs_region:
+            assert region is not None, "region_film / region_adagn cần region"
             r = torch.as_tensor(region, device=x.device, dtype=torch.long).reshape(-1).expand(x.shape[0])
+            emb = self.region_emb(r) if self.region_adagn else None
             for m in self.modules():
                 if isinstance(m, RegionFiLMGroupNorm):
                     m.region = r
+                elif isinstance(m, AdaGroupNorm):
+                    m.emb = emb
         k = 2**self.depth
         assert x.shape[-2] % k == 0 and x.shape[-1] % k == 0, f"H, W phải chia hết cho {k}, nhận {tuple(x.shape[-2:])}"
         feat = self.ms_extract(x) if self.multiscale_input else None

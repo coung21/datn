@@ -54,7 +54,7 @@ def predict_volume(
     meta = ds.metas[pid]
     zs = list(range(meta["shape"][0])) if slices is None else list(slices)
     out = np.empty((len(zs), *meta["shape"][1:]), np.float32)
-    region = REGION_IDS[parse_id(pid)["region"]] if getattr(model, "region_film", False) else None
+    region = REGION_IDS[parse_id(pid)["region"]] if getattr(model, "needs_region", False) else None
     for s in range(0, len(zs), chunk):
         part = zs[s:s + chunk]
         cond = torch.from_numpy(np.stack([ds.load_slice(pid, z)[0] for z in part]))

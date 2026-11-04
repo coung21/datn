@@ -50,7 +50,7 @@ def structure_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tenso
 
 def region_kwargs(model: nn.Module, batch) -> dict:
     """Chỉ truyền nhãn vùng cho model có điều kiện hóa theo vùng."""
-    return {"region": batch["region"]} if getattr(model, "region_film", False) else {}
+    return {"region": batch["region"]} if getattr(model, "needs_region", False) else {}
 
 
 class Regression(Method):

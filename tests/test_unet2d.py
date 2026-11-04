@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from src.models import UNet2D, build_model
-from src.models.unet2d import RegionFiLMGroupNorm
+from src.models.unet2d import AdaGroupNorm, RegionFiLMGroupNorm
 from src.utils.config import load_config
 
 
@@ -273,3 +273,32 @@ def test_region_film():
     for bad in (dict(norm="batch"), dict(norm="group", tissue_film=True)):
         with pytest.raises(ValueError):
             UNet2D(region_film=True, **bad)
+
+
+def test_region_adagn():
+    torch.manual_seed(0)
+    ag = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True)
+    ra = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True, region_adagn=True, region_emb_channels=16)
+    # Linear chiếu (scale, shift) khởi tạo 0: cùng trọng số phần chung thì đầu ra giống hệt GN + AG
+    missing = ra.load_state_dict(ag.state_dict(), strict=False).missing_keys
+    # GN thứ 2 nằm trong AdaGroupNorm (.norm.) nên không nhận trọng số từ GN + AG; GN khởi tạo 1 / 0 nên vẫn trùng
+    assert missing and all(k.startswith("region_emb") or ".proj." in k or ".norm." in k for k in missing)
+    x = torch.randn(2, 3, 32, 32)
+    for region in (0, 1, torch.tensor([0, 1])):
+        assert torch.allclose(ra(x, region=region), ag(x), atol=1e-5)
+    norms = [m for m in ra.modules() if isinstance(m, AdaGroupNorm)]
+    assert len(norms) == 3 + 1 + 3  # GN thứ 2 của mỗi khối conv
+    assert ra.needs_region and not ag.needs_region
+    out = ra(x, region=torch.tensor([0, 1]))
+    out.mean().backward()
+    assert all(m.proj[1].weight.grad.abs().sum() > 0 for m in norms)
+    # sau khi proj khác 0 thì 2 vùng cho đầu ra khác nhau
+    with torch.no_grad():
+        for m in norms:
+            m.proj[1].weight.normal_(0, 0.1)
+    assert not torch.allclose(ra(x[:1], region=0), ra(x[:1], region=1), atol=1e-4)
+    with pytest.raises(AssertionError):
+        ra(x)
+    for bad in (dict(norm="batch"), dict(norm="group", block="res"), dict(norm="group", region_film=True)):
+        with pytest.raises(ValueError):
+            UNet2D(region_adagn=True, **bad)

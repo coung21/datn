@@ -340,3 +340,11 @@ def test_train_region_film(tiny_run):
     run_dir = run("model.norm=group", "model.attention_gates=true", "model.region_film=true", "run_name=tiny_rfilm")
     assert pd.read_csv(run_dir / "train_log.csv")["loss"].notna().all()
     assert (run_dir / "val_full.csv").exists()
+
+
+def test_train_region_adagn(tiny_run):
+    runs, run = tiny_run
+    run_dir = run("model.norm=group", "model.attention_gates=true", "model.region_adagn=true",
+                  "model.region_emb_channels=16", "run_name=tiny_radagn")
+    assert pd.read_csv(run_dir / "train_log.csv")["loss"].notna().all()
+    assert (run_dir / "val_full.csv").exists()
