@@ -1,0 +1,8 @@
+# UNet 2.5D + GroupNorm + attention gate + FiLM theo vùng (não / chậu).
+# So với unet2d_gn_ag (MAE test 69.26): mọi GN trong khối conv encoder, bottleneck và decoder có gamma/beta riêng
+# cho từng vùng (khởi tạo 1 / 0). Nhãn vùng lấy từ mã bệnh nhân. Còn lại giữ nguyên base.yaml.
+run_name: unet2d_gn_ag_rfilm
+model:
+  norm: group
+  attention_gates: true
+  region_film: true

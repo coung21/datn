@@ -21,6 +21,7 @@ import numpy as np
 CT_CLIP = (-1024, 3000)
 MR_PERCENTILES = (0.5, 1.0, 50.0, 99.0, 99.5)
 REGIONS = {"B": "brain", "P": "pelvis"}
+REGION_IDS = {"brain": 0, "pelvis": 1}  # nhãn vùng cho model điều kiện hóa theo vùng
 
 
 def parse_id(pid: str) -> dict:

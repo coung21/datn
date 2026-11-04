@@ -47,6 +47,7 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   multiscale_branch_channels: 16    # số kênh mỗi nhánh dilation
   multiscale_channels: 64           # số kênh F sau khi trộn
   multiscale_dilations: [1, 2, 4, 8]
+  region_film: false                # GN trong khối conv có gamma/beta riêng cho não / chậu
 
 method:
   name: regression

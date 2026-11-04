@@ -7,16 +7,20 @@ import torch
 from monai.inferers import sliding_window_inference
 
 from ..data.dataset import SliceDataset, denormalize_ct
-from ..data.preprocess import CT_CLIP, restore_full_volume
+from ..data.preprocess import CT_CLIP, REGION_IDS, parse_id, restore_full_volume
 from ..methods import Method
 
 AUTOCAST_DTYPES = {"bf16": torch.bfloat16, "fp32": None}
 
 
 def predict_slices(
-    method: Method, model, cond: torch.Tensor, nfe: int, inf_cfg: dict, device: torch.device
+    method: Method, model, cond: torch.Tensor, nfe: int, inf_cfg: dict, device: torch.device,
+    region: int | None = None,
 ) -> torch.Tensor:
-    """cond [N, C, H, W] (H, W tùy ý) -> CT chuẩn hóa [N, 1, H, W] trên CPU."""
+    """cond [N, C, H, W] (H, W tùy ý) -> CT chuẩn hóa [N, 1, H, W] trên CPU.
+
+    region: nhãn vùng (0 não, 1 chậu) chung cho mọi lát, chỉ truyền cho model điều kiện hóa theo vùng."""
+    kw = {} if region is None else {"region": region}
     dtype = AUTOCAST_DTYPES[inf_cfg["precision"]]
     roi = inf_cfg["roi_size"]
     with torch.no_grad(), torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
@@ -24,7 +28,7 @@ def predict_slices(
             cond.to(device),
             roi_size=(roi, roi),
             sw_batch_size=inf_cfg["sw_batch_size"],
-            predictor=lambda x: method.predict(model, x, nfe),
+            predictor=lambda x: method.predict(model, x, nfe, **kw),
             overlap=inf_cfg["overlap"],
             mode=inf_cfg["blend_mode"],
             cval=inf_cfg["pad_value"],
@@ -50,10 +54,11 @@ def predict_volume(
     meta = ds.metas[pid]
     zs = list(range(meta["shape"][0])) if slices is None else list(slices)
     out = np.empty((len(zs), *meta["shape"][1:]), np.float32)
+    region = REGION_IDS[parse_id(pid)["region"]] if getattr(model, "region_film", False) else None
     for s in range(0, len(zs), chunk):
         part = zs[s:s + chunk]
         cond = torch.from_numpy(np.stack([ds.load_slice(pid, z)[0] for z in part]))
-        out[s:s + len(part)] = predict_slices(method, model, cond, nfe, inf_cfg, device)[:, 0].numpy()
+        out[s:s + len(part)] = predict_slices(method, model, cond, nfe, inf_cfg, device, region)[:, 0].numpy()
 
     hu = denormalize_ct(out, ds.ct_clip)
     _, mask = ds.load_volume(pid)

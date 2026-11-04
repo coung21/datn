@@ -48,6 +48,11 @@ def structure_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tenso
     return ce + 0.5 * dice
 
 
+def region_kwargs(model: nn.Module, batch) -> dict:
+    """Chỉ truyền nhãn vùng cho model có điều kiện hóa theo vùng."""
+    return {"region": batch["region"]} if getattr(model, "region_film", False) else {}
+
+
 class Regression(Method):
     extra_in_channels = 0
 
@@ -60,10 +65,10 @@ class Regression(Method):
 
     def loss(self, model: nn.Module, batch):
         if self.struct_weight <= 0:
-            pred = model(batch["cond"])
+            pred = model(batch["cond"], **region_kwargs(model, batch))
             loss = LOSSES[self.loss_name](pred.float(), batch["ct"], batch["mask"])
             return loss, {self.loss_name: loss.item()}
-        pred, structs = model(batch["cond"], return_struct=True)
+        pred, structs = model(batch["cond"], return_struct=True, **region_kwargs(model, batch))
         rec = LOSSES[self.loss_name](pred.float(), batch["ct"], batch["mask"])
         labels = structure_labels(batch["ct"], self.struct_thresholds)
         weights = [2.0 ** -level for level, _ in structs]
@@ -72,8 +77,9 @@ class Regression(Method):
         return loss, {self.loss_name: rec.item(), "struct": struct.item()}
 
     @torch.no_grad()
-    def predict(self, model, cond, nfe=1):
-        return model(cond).float().clamp(-1, 1)
+    def predict(self, model, cond, nfe=1, region=None):
+        kw = {} if region is None else {"region": region}
+        return model(cond, **kw).float().clamp(-1, 1)
 
     def nfe_values(self, requested):
         return [1]  # không lặp, NFE luôn bằng 1

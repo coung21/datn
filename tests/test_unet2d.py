@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from src.models import UNet2D, build_model
+from src.models.unet2d import RegionFiLMGroupNorm
 from src.utils.config import load_config
 
 
@@ -244,3 +245,31 @@ def test_multiscale_input():
     out = ms(x)
     out.mean().backward()
     assert all(p.weight.grad.abs().sum() > 0 for p in ms.ms_proj)
+
+
+def test_region_film():
+    torch.manual_seed(0)
+    ag = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True)
+    rf = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True, region_film=True)
+    # gamma = 1, beta = 0 lúc khởi tạo: cùng conv thì đầu ra giống GN thường, với cả 2 vùng
+    sd = {k: v for k, v in ag.state_dict().items() if k in rf.state_dict()}
+    rf.load_state_dict(sd, strict=False)
+    x = torch.randn(2, 3, 32, 32)
+    for region in (0, 1, torch.tensor([0, 1])):
+        assert torch.allclose(rf(x, region=region), ag(x), atol=1e-5)
+    norms = [m for m in rf.modules() if isinstance(m, RegionFiLMGroupNorm)]
+    assert len(norms) == 2 * (3 + 1 + 3)  # 2 GN mỗi khối conv: encoder, bottleneck, decoder
+    assert all(isinstance(g.w_x[1], torch.nn.GroupNorm) for g in rf.gates)  # gate giữ GN thường
+    # đổi gamma của vùng chậu: mẫu não không đổi, mẫu chậu đổi
+    with torch.no_grad():
+        for m in norms:
+            m.gamma[1].mul_(1.5)
+    out = rf(x, region=torch.tensor([0, 1]))
+    assert torch.allclose(out[0], ag(x)[0], atol=1e-5) and not torch.allclose(out[1], ag(x)[1], atol=1e-3)
+    out.mean().backward()
+    assert all(m.gamma.grad[0].abs().sum() > 0 and m.gamma.grad[1].abs().sum() > 0 for m in norms)
+    with pytest.raises(AssertionError):
+        rf(x)
+    for bad in (dict(norm="batch"), dict(norm="group", tissue_film=True)):
+        with pytest.raises(ValueError):
+            UNet2D(region_film=True, **bad)

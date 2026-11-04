@@ -34,6 +34,11 @@ tầng encoder s = 1..depth-1 và bottleneck:
     e_s = Block_s(MaxPool(e_{s-1}) + Proj_s(AvgPool_{2^s}(F)))
 Tầng 0 vẫn nhận MRI bình thường. Lúc khởi tạo model giống hệt khi không bật.
 
+region_film=True (cần norm="group"): điều kiện hóa theo vùng giải phẫu (0 não, 1 chậu). Mọi GN trong các khối
+conv của encoder, bottleneck và decoder có gamma/beta riêng cho từng vùng:
+    GN_r(x) = gamma_r * x_hat + beta_r
+gamma_r = 1, beta_r = 0 lúc khởi tạo. Attention gate và phần còn lại dùng chung. forward cần region.
+
 block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, He et al. 2016), cùng số conv:
     y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
 shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
@@ -60,6 +65,8 @@ def make_norm(kind: str, channels: int) -> nn.Module:
         return nn.InstanceNorm2d(channels, affine=True)
     if kind == "group":
         return nn.GroupNorm(min(32, channels), channels)
+    if kind == "region_group":
+        return RegionFiLMGroupNorm(channels)
     raise ValueError(f"norm '{kind}' không có, chọn batch | instance | group")
 
 
@@ -138,6 +145,25 @@ class TissueFiLMGroupNorm(nn.Module):
         return gamma * self.norm(x) + beta
 
 
+class RegionFiLMGroupNorm(nn.Module):
+    """GroupNorm không affine, rồi gamma/beta tra theo nhãn vùng của từng mẫu.
+
+    Nhãn vùng do UNet2D gán vào thuộc tính `region` ([B] long) ngay trước mỗi lần forward."""
+
+    def __init__(self, channels: int, n_regions: int = 2):
+        super().__init__()
+        self.norm = nn.GroupNorm(min(32, channels), channels, affine=False)
+        self.gamma = nn.Parameter(torch.ones(n_regions, channels))
+        self.beta = nn.Parameter(torch.zeros(n_regions, channels))
+        self.region: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        assert self.region is not None, "RegionFiLMGroupNorm cần nhãn vùng (gọi qua UNet2D với region=...)"
+        gamma = self.gamma[self.region].to(x.dtype)[:, :, None, None]
+        beta = self.beta[self.region].to(x.dtype)[:, :, None, None]
+        return gamma * self.norm(x) + beta
+
+
 class TissueFiLMConvBlock(nn.Module):
     """2 x [Conv3x3 -> GN điều khiển bởi P -> ReLU]."""
 
@@ -195,7 +221,7 @@ class UNet2D(nn.Module):
                  attention_head_channels: int = 64, block: str = "conv",
                  structure_guided: bool = False, mixture_head: bool = False, tissue_film: bool = False,
                  multiscale_input: bool = False, multiscale_branch_channels: int = 16,
-                 multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8)):
+                 multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8), region_film: bool = False):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -203,6 +229,8 @@ class UNet2D(nn.Module):
             raise ValueError("structure_guided cần attention_gates=True")
         if tissue_film and (norm != "group" or block != "conv" or structure_guided):
             raise ValueError("tissue_film cần norm=group, block=conv và structure_guided=False")
+        if region_film and (norm != "group" or tissue_film):
+            raise ValueError("region_film cần norm=group và tissue_film=False")
         if mixture_head and not structure_guided:
             raise ValueError("mixture_head cần structure_guided=True")
         if mixture_head and out_channels != 1:
@@ -211,12 +239,14 @@ class UNet2D(nn.Module):
         Gate = StructureGuidedGate if structure_guided else AttentionGate
         self.structure_guided, self.mixture_head, self.tissue_film = structure_guided, mixture_head, tissue_film
         self.in_channels, self.depth = in_channels, depth
+        self.region_film = region_film
+        block_norm = "region_group" if region_film else norm  # chỉ GN trong các khối conv đổi theo vùng
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
 
         self.down = nn.ModuleList()
         prev = in_channels
         for ch in chs[:-1]:
-            self.down.append(Block(prev, ch, norm))
+            self.down.append(Block(prev, ch, block_norm))
             prev = ch
         self.pool = nn.MaxPool2d(2)
         self.multiscale_input = multiscale_input
@@ -228,14 +258,14 @@ class UNet2D(nn.Module):
             for proj in self.ms_proj:
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
-        self.bottom = Block(chs[-2], chs[-1], norm)
+        self.bottom = Block(chs[-2], chs[-1], block_norm)
         self.bottom_attn = (SelfAttention2d(chs[-1], attention_head_channels, norm) if bottleneck_attention
                             else nn.Identity())
 
         self.up, self.dec, self.gates = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
         for ch in reversed(chs[:-1]):
             self.up.append(nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
-            self.dec.append(TissueFiLMConvBlock(ch * 2, ch) if tissue_film else Block(ch * 2, ch, norm))
+            self.dec.append(TissueFiLMConvBlock(ch * 2, ch) if tissue_film else Block(ch * 2, ch, block_norm))
             self.gates.append(Gate(ch, norm) if attention_gates else nn.Identity())
         n_cls = StructureGuidedGate.N_CLASSES
         if tissue_film:
@@ -248,10 +278,17 @@ class UNet2D(nn.Module):
         if structure_guided:
             self.struct_head = nn.Conv2d(chs[0], n_cls, 1)
 
-    def forward(self, x: torch.Tensor, return_struct: bool = False):
+    def forward(self, x: torch.Tensor, return_struct: bool = False, region=None):
         """return_struct=True (structure_guided hoặc tissue_film): trả thêm list (tầng l, logit cấu trúc).
-        Tầng l có độ phân giải H/2^l; đầu P0 của structure_guided cũng là tầng 0."""
+        Tầng l có độ phân giải H/2^l; đầu P0 của structure_guided cũng là tầng 0.
+        region (region_film): int chung cho cả batch hoặc tensor [B], 0 não, 1 chậu."""
         assert x.shape[1] == self.in_channels, f"Kỳ vọng {self.in_channels} kênh vào, nhận {x.shape[1]}"
+        if self.region_film:
+            assert region is not None, "region_film cần region"
+            r = torch.as_tensor(region, device=x.device, dtype=torch.long).reshape(-1).expand(x.shape[0])
+            for m in self.modules():
+                if isinstance(m, RegionFiLMGroupNorm):
+                    m.region = r
         k = 2**self.depth
         assert x.shape[-2] % k == 0 and x.shape[-1] % k == 0, f"H, W phải chia hết cho {k}, nhận {tuple(x.shape[-2:])}"
         feat = self.ms_extract(x) if self.multiscale_input else None

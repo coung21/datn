@@ -92,6 +92,7 @@ def test_train_sample(processed, patch):
         for k in ("cond", "ct"):
             assert s[k].min() >= -1 and s[k].max() <= 1
         assert s["mask"].mean() >= 0.1
+        assert s["region"] == (0 if s["id"].startswith("1B") else 1)
 
 
 def test_crop_alignment_and_flip(processed):

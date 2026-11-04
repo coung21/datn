@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .preprocess import CT_CLIP, parse_id
+from .preprocess import CT_CLIP, REGION_IDS, parse_id
 
 
 def normalize_ct(hu: np.ndarray, clip=CT_CLIP) -> np.ndarray:
@@ -175,7 +175,7 @@ class SliceDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         pid, z = self.index[i]
         mr, ct, mask = self.load_slice(pid, z)
-        sample = {"id": pid, "z": z}
+        sample = {"id": pid, "z": z, "region": REGION_IDS[parse_id(pid)["region"]]}
 
         if self.mode == "train":
             size = self.patch_size
