@@ -239,21 +239,27 @@ class MultiScaleExtractor(nn.Module):
 
 
 class MultiViewExtractor(nn.Module):
-    """Nhánh conv 3D dẹt theo 3 mặt cắt trên khối K lát MR, trộn rồi gộp trục z -> đặc trưng 2D của lát giữa."""
+    """Nhánh conv 3D dẹt theo 3 mặt cắt trên khối K lát MR, trộn rồi gộp trục z -> đặc trưng 2D của lát giữa.
+
+    planes: các mặt cắt được dựng nhánh (mặc định cả 3), dùng cho ablation theo mặt cắt."""
 
     KERNELS = {"axial": (1, 3, 3), "coronal": (3, 1, 3), "sagittal": (3, 3, 1)}
 
-    def __init__(self, n_slices: int, branch_ch: int, out_ch: int):
+    def __init__(self, n_slices: int, branch_ch: int, out_ch: int, planes=None):
         super().__init__()
+        planes = list(self.KERNELS) if planes is None else list(planes)
+        if not planes or len(set(planes)) != len(planes) or any(p not in self.KERNELS for p in planes):
+            raise ValueError(f"multiview_planes phải là tập con khác rỗng, không lặp của {list(self.KERNELS)}: {planes}")
 
         def conv(i, o, k):
             return [nn.Conv3d(i, o, k, padding=tuple(s // 2 for s in k), bias=False),
                     nn.GroupNorm(min(8, o), o), nn.ReLU(inplace=True)]
 
         self.branches = nn.ModuleDict(
-            {name: nn.Sequential(*conv(1, branch_ch, k), *conv(branch_ch, branch_ch, k)) for name, k in self.KERNELS.items()})
+            {name: nn.Sequential(*conv(1, branch_ch, k), *conv(branch_ch, branch_ch, k))
+             for name, k in self.KERNELS.items() if name in planes})
         self.fuse = nn.Sequential(
-            nn.Conv3d(3 * branch_ch, out_ch, 1, bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True),
+            nn.Conv3d(len(planes) * branch_ch, out_ch, 1, bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True),
             nn.Conv3d(out_ch, out_ch, (n_slices, 1, 1), bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -290,7 +296,7 @@ class UNet2D(nn.Module):
                  multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8), region_film: bool = False,
                  region_adagn: bool = False, region_emb_channels: int = 256,
                  multiview_input: bool = False, main_in_channels: int = 3, multiview_branch_channels: int = 16,
-                 multiview_channels: int = 64):
+                 multiview_channels: int = 64, multiview_planes=None):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -343,7 +349,8 @@ class UNet2D(nn.Module):
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
         if multiview_input:
-            self.mv_extract = MultiViewExtractor(in_channels, multiview_branch_channels, multiview_channels)
+            self.mv_extract = MultiViewExtractor(in_channels, multiview_branch_channels, multiview_channels,
+                                                 multiview_planes)
             self.mv_proj = nn.ModuleList(nn.Conv2d(multiview_channels, ch, 1) for ch in chs[:-1])
             for proj in self.mv_proj:
                 nn.init.zeros_(proj.weight)

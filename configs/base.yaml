@@ -54,6 +54,7 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   main_in_channels: 3               # số lát giữa UNet chính nhận khi multiview_input
   multiview_branch_channels: 16     # số kênh mỗi nhánh mặt cắt
   multiview_channels: 64            # số kênh F sau khi trộn
+  multiview_planes: [axial, coronal, sagittal]   # các mặt cắt có nhánh (ablation: bỏ bớt)
 
 method:
   name: regression

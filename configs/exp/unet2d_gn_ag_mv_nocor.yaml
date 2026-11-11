@@ -1,0 +1,10 @@
+# Ablation theo mặt cắt của unet2d_gn_ag_mv: bỏ nhánh coronal (16 kênh mỗi nhánh, còn lại giữ nguyên).
+run_name: unet2d_gn_ag_mv_nocor
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true
+  multiview_planes: [axial, sagittal]

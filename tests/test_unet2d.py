@@ -328,3 +328,27 @@ def test_multiview_input():
         kw = dict(in_channels=9, norm="group", multiview_input=True) | bad
         with pytest.raises(ValueError):
             UNet2D(**kw)
+
+
+@pytest.mark.parametrize("planes", [["axial"], ["coronal", "sagittal"], ["axial", "sagittal"], ["axial", "coronal"]])
+def test_multiview_planes(planes):
+    torch.manual_seed(0)
+    kw = dict(in_channels=9, base_channels=8, depth=3, norm="group", attention_gates=True, multiview_input=True,
+              multiview_branch_channels=4, multiview_channels=8)
+    full, part = UNet2D(**kw), UNet2D(**kw, multiview_planes=planes)
+    assert list(part.mv_extract.branches) == planes
+    assert sum(p.numel() for p in part.parameters()) < sum(p.numel() for p in full.parameters())
+    out = part(torch.randn(2, 9, 32, 32))
+    assert out.shape == (2, 1, 32, 32) and torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("planes", [[], ["axial", "axial"], ["oblique"]])
+def test_multiview_planes_invalid(planes):
+    with pytest.raises(ValueError):
+        UNet2D(in_channels=9, norm="group", multiview_input=True, multiview_planes=planes)
+
+
+def test_multiview_default_planes_keep_state_dict():
+    kw = dict(in_channels=9, base_channels=8, depth=3, norm="group", multiview_input=True)
+    a, b = UNet2D(**kw), UNet2D(**kw, multiview_planes=["axial", "coronal", "sagittal"])
+    assert list(a.state_dict()) == list(b.state_dict())
