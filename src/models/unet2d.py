@@ -241,15 +241,23 @@ class MultiScaleExtractor(nn.Module):
 class MultiViewExtractor(nn.Module):
     """Nhánh conv 3D dẹt theo 3 mặt cắt trên khối K lát MR, trộn rồi gộp trục z -> đặc trưng 2D của lát giữa.
 
-    planes: các mặt cắt được dựng nhánh (mặc định cả 3), dùng cho ablation theo mặt cắt."""
+    planes: các mặt cắt được dựng nhánh (mặc định cả 3), dùng cho ablation theo mặt cắt.
+    fusion: "concat" ghép thẳng các nhánh; "attention" nhân mỗi nhánh với trọng số theo vị trí trước khi ghép:
+        w = softmax_nhánh(Conv1x1x1(ReLU(Conv1x1x1([các nhánh]))))        [B, số nhánh, K, H, W]
+        nhánh_i <- số nhánh * w_i * nhánh_i
+    Conv cuối của attention khởi tạo 0 (w đều, hệ số 1) và việc tạo nó không làm lệch bộ sinh số ngẫu nhiên, nên
+    cùng seed thì model lúc khởi tạo giống hệt bản "concat". Ở chế độ eval, w gần nhất lưu ở self.view_weights."""
 
     KERNELS = {"axial": (1, 3, 3), "coronal": (3, 1, 3), "sagittal": (3, 3, 1)}
 
-    def __init__(self, n_slices: int, branch_ch: int, out_ch: int, planes=None):
+    def __init__(self, n_slices: int, branch_ch: int, out_ch: int, planes=None, fusion: str = "concat"):
         super().__init__()
         planes = list(self.KERNELS) if planes is None else list(planes)
         if not planes or len(set(planes)) != len(planes) or any(p not in self.KERNELS for p in planes):
             raise ValueError(f"multiview_planes phải là tập con khác rỗng, không lặp của {list(self.KERNELS)}: {planes}")
+
+        if fusion not in ("concat", "attention"):
+            raise ValueError(f"multiview_fusion '{fusion}' không có, chọn concat | attention")
 
         def conv(i, o, k):
             return [nn.Conv3d(i, o, k, padding=tuple(s // 2 for s in k), bias=False),
@@ -261,10 +269,25 @@ class MultiViewExtractor(nn.Module):
         self.fuse = nn.Sequential(
             nn.Conv3d(len(planes) * branch_ch, out_ch, 1, bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True),
             nn.Conv3d(out_ch, out_ch, (n_slices, 1, 1), bias=False), make_norm("group", out_ch), nn.ReLU(inplace=True))
+        self.attn = None
+        self.view_weights = None
+        if fusion == "attention":
+            rng = torch.get_rng_state()  # giữ nguyên dãy số ngẫu nhiên cho các lớp tạo sau
+            self.attn = nn.Sequential(nn.Conv3d(len(planes) * branch_ch, branch_ch, 1), nn.ReLU(inplace=True),
+                                      nn.Conv3d(branch_ch, len(planes), 1))
+            torch.set_rng_state(rng)
+            nn.init.zeros_(self.attn[-1].weight)
+            nn.init.zeros_(self.attn[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         v = x.unsqueeze(1)  # [B, 1, K, H, W]
-        return self.fuse(torch.cat([b(v) for b in self.branches.values()], dim=1)).squeeze(2)
+        feats = [b(v) for b in self.branches.values()]
+        if self.attn is not None:
+            w = self.attn(torch.cat(feats, dim=1)).softmax(dim=1)
+            if not self.training:
+                self.view_weights = w.detach()
+            feats = [len(feats) * w[:, i:i + 1] * f for i, f in enumerate(feats)]
+        return self.fuse(torch.cat(feats, dim=1)).squeeze(2)
 
 
 class SelfAttention2d(nn.Module):
@@ -296,7 +319,7 @@ class UNet2D(nn.Module):
                  multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8), region_film: bool = False,
                  region_adagn: bool = False, region_emb_channels: int = 256,
                  multiview_input: bool = False, main_in_channels: int = 3, multiview_branch_channels: int = 16,
-                 multiview_channels: int = 64, multiview_planes=None):
+                 multiview_channels: int = 64, multiview_planes=None, multiview_fusion: str = "concat"):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -350,7 +373,7 @@ class UNet2D(nn.Module):
                 nn.init.zeros_(proj.bias)
         if multiview_input:
             self.mv_extract = MultiViewExtractor(in_channels, multiview_branch_channels, multiview_channels,
-                                                 multiview_planes)
+                                                 multiview_planes, multiview_fusion)
             self.mv_proj = nn.ModuleList(nn.Conv2d(multiview_channels, ch, 1) for ch in chs[:-1])
             for proj in self.mv_proj:
                 nn.init.zeros_(proj.weight)

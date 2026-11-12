@@ -1,0 +1,11 @@
+# unet2d_gn_ag_mv + trộn 3 mặt cắt bằng attention: mỗi nhánh được nhân với trọng số theo vị trí (softmax trên 3 nhánh)
+# trước khi ghép. Conv cuối của attention khởi tạo 0 nên lúc khởi tạo giống hệt unet2d_gn_ag_mv. Còn lại giữ nguyên.
+run_name: unet2d_gn_ag_mv_att
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true
+  multiview_fusion: attention

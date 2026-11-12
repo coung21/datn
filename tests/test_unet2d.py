@@ -352,3 +352,43 @@ def test_multiview_default_planes_keep_state_dict():
     kw = dict(in_channels=9, base_channels=8, depth=3, norm="group", multiview_input=True)
     a, b = UNet2D(**kw), UNet2D(**kw, multiview_planes=["axial", "coronal", "sagittal"])
     assert list(a.state_dict()) == list(b.state_dict())
+
+
+def test_multiview_attention_fusion():
+    kw = dict(in_channels=9, base_channels=8, depth=3, norm="group", attention_gates=True, multiview_input=True,
+              multiview_branch_channels=4, multiview_channels=8)
+    torch.manual_seed(0)
+    plain = UNet2D(**kw)
+    torch.manual_seed(0)
+    att = UNet2D(**kw, multiview_fusion="attention")
+    # cùng seed: mọi trọng số chung giống hệt, attention chỉ thêm tham số
+    sd = att.state_dict()
+    assert all(torch.equal(v, sd[k]) for k, v in plain.state_dict().items())
+    extra = sum(p.numel() for p in att.parameters()) - sum(p.numel() for p in plain.parameters())
+    assert extra == (12 * 4 + 4) + (4 * 3 + 3)
+    # mv_proj khởi tạo 0 nên phải xáo nó mới thấy nhánh; khi đó 2 model vẫn cho cùng đầu ra (w đều = 1/3)
+    x = torch.randn(2, 9, 32, 32)
+    for m in (plain, att):
+        for i, proj in enumerate(m.mv_proj):
+            torch.manual_seed(i)
+            nn_init = torch.randn_like(proj.weight) * 0.1
+            proj.weight.data.copy_(nn_init)
+        m.eval()
+    with torch.no_grad():
+        assert torch.allclose(plain(x), att(x), atol=1e-5)
+    w = att.mv_extract.view_weights
+    assert w.shape == (2, 3, 9, 32, 32) and torch.allclose(w, torch.full_like(w, 1 / 3))
+    # attention nhận gradient và làm đổi đầu ra khi trọng số lệch khỏi đều
+    att.train()
+    att(x).mean().backward()
+    assert att.mv_extract.attn[-1].weight.grad.abs().sum() > 0
+    att.eval()
+    att.mv_extract.attn[-1].bias.data = torch.tensor([2.0, 0.0, -2.0])
+    with torch.no_grad():
+        assert not torch.allclose(plain(x), att(x), atol=1e-5)
+        assert torch.allclose(att.mv_extract.view_weights.sum(1), torch.ones(2, 9, 32, 32))
+
+
+def test_multiview_fusion_invalid():
+    with pytest.raises(ValueError):
+        UNet2D(in_channels=9, norm="group", multiview_input=True, multiview_fusion="sum")
