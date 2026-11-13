@@ -90,7 +90,8 @@ def test_config(tmp_path):
     cfg = apply_overrides({"a": {"b": 1}}, ["a.b=2.5", "x.y=[1, 2]", "flag=false"])
     assert cfg == {"a": {"b": 2.5}, "x": {"y": [1, 2]}, "flag": False}
     cfg = load_config("configs/base.yaml", "configs/exp/unet2d_baseline.yaml")
-    assert cfg["run_name"] == "unet2d_baseline" and cfg["method"] == {"name": "regression", "loss": "l1", "struct_weight": 0.0, "struct_thresholds": [-400, 200]}
+    assert cfg["run_name"] == "unet2d_baseline" and cfg["method"] == {"name": "regression", "loss": "l1", "struct_weight": 0.0, "struct_thresholds": [-400, 200],
+                                                                  "bone_weight": 0.0, "bone_threshold": 200, "bone_dilate": 2}
     assert cfg["model"]["in_channels"] == 2 * cfg["data"]["context_slices"] + 1 and cfg["model"]["base_channels"] == 64
 
 
@@ -357,3 +358,36 @@ def test_train_multiview_input(tiny_run):
                   "run_name=tiny_mv")
     assert pd.read_csv(run_dir / "train_log.csv")["loss"].notna().all()
     assert (run_dir / "val_full.csv").exists()
+
+
+def test_bone_weight_map_and_loss():
+    from src.methods.regression import bone_weight_map
+
+    def norm(hu):
+        return (hu + 1024) / (3000 + 1024) * 2 - 1
+
+    ct = torch.full((1, 1, 9, 9), norm(0.0))
+    ct[0, 0, 4, 4] = norm(1000.0)
+    w = bone_weight_map(ct, 2.0, 200.0, dilate=2)
+    assert w.shape == ct.shape and w[0, 0, 2:7, 2:7].eq(3).all() and w.sum() == 81 + 2 * 25
+    assert bone_weight_map(ct, 2.0, 200.0, dilate=0).sum() == 81 + 2
+
+    # sai số 1 ở xương, 0 ở chỗ khác: L1 thường = 1/81, có trọng số = 3 / (81 + 2*25)
+    class Fixed(torch.nn.Module):
+        def forward(self, x):
+            out = ct.clone()
+            out[0, 0, 4, 4] += 1.0
+            return out
+
+    batch = {"cond": torch.zeros(1, 3, 9, 9), "ct": ct, "mask": torch.ones_like(ct)}
+    plain, logs0 = Regression().loss(Fixed(), batch)
+    weighted, logs = Regression(bone_weight=2.0).loss(Fixed(), batch)
+    assert torch.isclose(plain, torch.tensor(1 / 81)) and list(logs0) == ["l1"]
+    assert torch.isclose(weighted, torch.tensor(3 / 131))
+    assert abs(logs["l1"] - 1 / 81) < 1e-6 and abs(logs["l1_bone"] - 3 / 131) < 1e-6
+
+
+def test_train_bone_weight(tiny_run):
+    _, run = tiny_run
+    log = pd.read_csv(run("model.norm=group", "method.bone_weight=2.0", "run_name=tiny_bw") / "train_log.csv")
+    assert {"loss_l1", "loss_l1_bone"} <= set(log.columns) and (log["loss"] - log["loss_l1_bone"]).abs().max() < 1e-6

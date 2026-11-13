@@ -64,3 +64,34 @@ def test_draw_writes_figures(tmp_path):
     for view in ("axial", "coronal"):
         draw(view, json.loads(json.dumps(info)), data, tmp_path / f"q_{view}")
         assert (tmp_path / f"q_{view}.png").stat().st_size > 0 and (tmp_path / f"q_{view}.pdf").exists()
+
+
+def test_error_region_zones():
+    import torch
+
+    from scripts.error_regions import ZONES, summarize, zone_masks, zone_stats
+
+    ct = torch.zeros(2, 40, 40)
+    mask = torch.zeros(2, 40, 40, dtype=torch.bool)
+    mask[:, 4:36, 4:36] = True
+    ct[:, 14:26, 14:26] = 1000.0   # khối xương 12x12
+    ct[:, 28:31, 8:11] = -1000.0  # hốc khí bên trong
+    zones = zone_masks(ct, mask)
+    assert list(zones) == ZONES
+    stacked = torch.stack(list(zones.values())).sum(0)
+    assert torch.equal(stacked > 0, mask) and stacked.max() == 1  # rời nhau, phủ kín mask
+    assert zones["bone_inner"].sum() == 2 * 8 * 8             # co 2 px mỗi phía
+    assert zones["bone_edge"].sum() == 2 * (16 * 16 - 8 * 8)  # dải 2 px trong + 2 px ngoài
+    assert zones["body_edge"].sum() == 2 * (32 * 32 - 24 * 24)
+    assert zones["air"].sum() == 2 * 9
+
+    sct = ct.clone()
+    sct[zones["bone_inner"]] -= 100.0  # dự đoán xương thấp hơn 100 HU
+    rows = {r["zone"]: r for r in zone_stats(sct, ct, mask)}
+    assert rows["bone_inner"]["mae"] == 100 and rows["bone_inner"]["bias"] == -100
+    assert abs(rows["bone_inner"]["err_frac"] - 1) < 1e-6 and rows["soft"]["mae"] == 0
+    assert abs(sum(r["vol_frac"] for r in rows.values()) - 1) < 1e-6
+
+    df = pd.DataFrame([{"model": "A", "id": "1BA001", "region": "brain", **r} for r in rows.values()])
+    s = summarize(df).set_index("zone")
+    assert s.loc["bone_inner", "err_%"] > 99 and s.loc["bone_inner", "bias"] == -100

@@ -62,6 +62,9 @@ method:
   loss: l1                          # l1 | l2
   struct_weight: 0.0                # > 0: thêm loss cấu trúc cho SG-gate (lambda)
   struct_thresholds: [-400, 200]    # HU: khí < -400, xương > 200
+  bone_weight: 0.0                  # > 0: loss tái tạo nhân (1 + bone_weight) ở xương và dải biên xương
+  bone_threshold: 200               # HU: xương > 200
+  bone_dilate: 2                    # giãn vùng xương thêm 2 điểm ảnh (dải biên ngoài)
 
 train:
   precision: bf16

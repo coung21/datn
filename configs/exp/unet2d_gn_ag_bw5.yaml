@@ -1,0 +1,7 @@
+# unet2d_gn_ag + L1 có trọng số ở xương: w = 1 + 5 tại vùng CT > 200 HU đã giãn 2 điểm ảnh. Còn lại giữ nguyên.
+run_name: unet2d_gn_ag_bw5
+model:
+  norm: group
+  attention_gates: true
+method:
+  bone_weight: 5.0

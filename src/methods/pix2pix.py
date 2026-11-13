@@ -30,9 +30,12 @@ def gan_loss(logits: torch.Tensor, real: bool, mode: str) -> torch.Tensor:
 
 class Pix2Pix(Regression):
     def __init__(self, gan_mode: str = "vanilla", lambda_l1: float = 100.0, disc: dict | None = None,
-                 loss: str = "l1", struct_weight: float = 0.0, struct_thresholds=(-400.0, 200.0)):
+                 loss: str = "l1", struct_weight: float = 0.0, struct_thresholds=(-400.0, 200.0),
+                 bone_weight: float = 0.0, bone_threshold: float = 200.0, bone_dilate: int = 2):
         if struct_weight:
             raise ValueError("pix2pix chưa hỗ trợ loss cấu trúc (struct_weight phải bằng 0)")
+        if bone_weight:
+            raise ValueError("pix2pix chưa hỗ trợ loss có trọng số ở xương (bone_weight phải bằng 0)")
         super().__init__(loss=loss)  # loss tái tạo, pix2pix chuẩn là l1
         gan_loss(torch.zeros(1), True, gan_mode)  # kiểm tra gan_mode sớm
         self.gan_mode, self.lambda_l1 = gan_mode, lambda_l1
