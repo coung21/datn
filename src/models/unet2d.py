@@ -41,6 +41,11 @@ nhận main_in_channels lát giữa; khối K lát đi qua nhánh multi-view 3D 
 F (multiview_channels kênh, độ phân giải đầy đủ) được đưa vào encoder giống multiscale_input (AvgPool, Conv1x1 khởi
 tạo 0, cộng vào đầu vào khối conv tầng 1..depth-1 và bottleneck). Lúc khởi tạo model giống UNet chỉ nhận lát giữa.
 
+multiview_pyramid=True (cần multiview_input=True, fusion concat): thay nhánh trên bằng MultiViewPyramid. Mỗi mặt cắt là
+1 encoder conv 3D dẹt, giảm 2x theo H, W mỗi tầng (giữ K lát); tầng s tự gộp mặt cắt và trục z thành F_s ở độ phân giải
+H/2^s, cộng vào tầng encoder s (s = 1..depth-1) và bottleneck (s = depth) qua Conv1x1 khởi tạo 0, thay vì AvgPool
+một F độ phân giải đầy đủ. Trường nhìn của nhánh tăng theo tầng như UNet, nên tầng sâu có ngữ cảnh 3D ở quy mô lớn.
+
 region_film=True (cần norm="group"): điều kiện hóa theo vùng giải phẫu (0 não, 1 chậu). Mọi GN trong các khối
 conv của encoder, bottleneck và decoder có gamma/beta riêng cho từng vùng:
     GN_r(x) = gamma_r * x_hat + beta_r
@@ -290,6 +295,50 @@ class MultiViewExtractor(nn.Module):
         return self.fuse(torch.cat(feats, dim=1)).squeeze(2)
 
 
+class MultiViewPyramid(nn.Module):
+    """Nhánh multi-view phân cấp: mỗi mặt cắt là 1 encoder conv 3D dẹt riêng, giảm 2x theo H, W mỗi tầng (giữ K lát).
+    Mỗi tầng s = 1..n_levels gộp các mặt cắt rồi gộp trục z về lát giữa, cho đặc trưng 2D ở độ phân giải H/2^s:
+        G_0^p = Stage_0^p(MR),   G_s^p = Stage_s^p(AvgPool3d_(1,2,2)(G_{s-1}^p))      (p: axial | coronal | sagittal)
+        F_s = ReLU(GN(Conv3d_(K,1,1)(ReLU(GN(Conv1x1x1([G_s^p for p]))))))
+    Stage_s^p: 2 lớp Conv3d kernel mặt cắt p -> GN -> ReLU, c_s = min(branch_ch * 2^s, max_branch) kênh.
+    F_s có min(out_ch * 2^(s-1), max_out) kênh. Tầng 0 chỉ làm đầu vào cho tầng 1 (không trả về)."""
+
+    def __init__(self, n_slices: int, branch_ch: int, out_ch: int, n_levels: int, planes=None,
+                 max_branch: int = 128, max_out: int = 256):
+        super().__init__()
+        kernels = MultiViewExtractor.KERNELS
+        planes = list(kernels) if planes is None else list(planes)
+        if not planes or len(set(planes)) != len(planes) or any(p not in kernels for p in planes):
+            raise ValueError(f"multiview_planes phải là tập con khác rỗng, không lặp của {list(kernels)}: {planes}")
+
+        def conv(i, o, k):
+            return [nn.Conv3d(i, o, k, padding=tuple(s // 2 for s in k), bias=False),
+                    nn.GroupNorm(min(8, o), o), nn.ReLU(inplace=True)]
+
+        self.branch_channels = [min(branch_ch * 2**s, max_branch) for s in range(n_levels + 1)]
+        self.out_channels = [min(out_ch * 2**(s - 1), max_out) for s in range(1, n_levels + 1)]
+        self.stages = nn.ModuleList()
+        prev = 1
+        for c in self.branch_channels:
+            self.stages.append(nn.ModuleDict(
+                {name: nn.Sequential(*conv(prev, c, kernels[name]), *conv(c, c, kernels[name])) for name in planes}))
+            prev = c
+        self.fuse = nn.ModuleList(nn.Sequential(
+            nn.Conv3d(len(planes) * c, o, 1, bias=False), make_norm("group", o), nn.ReLU(inplace=True),
+            nn.Conv3d(o, o, (n_slices, 1, 1), bias=False), make_norm("group", o), nn.ReLU(inplace=True))
+            for c, o in zip(self.branch_channels[1:], self.out_channels))
+        self.down = nn.AvgPool3d((1, 2, 2))
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """[B, K, H, W] -> [F_1, ..., F_n], F_s: [B, C_s, H/2^s, W/2^s]."""
+        g = {name: b(x.unsqueeze(1)) for name, b in self.stages[0].items()}
+        out = []
+        for stage, fuse in zip(self.stages[1:], self.fuse):
+            g = {name: b(self.down(g[name])) for name, b in stage.items()}
+            out.append(fuse(torch.cat(list(g.values()), dim=1)).squeeze(2))
+        return out
+
+
 class SelfAttention2d(nn.Module):
     def __init__(self, channels: int, head_channels: int, norm: str):
         super().__init__()
@@ -319,7 +368,8 @@ class UNet2D(nn.Module):
                  multiscale_channels: int = 64, multiscale_dilations=(1, 2, 4, 8), region_film: bool = False,
                  region_adagn: bool = False, region_emb_channels: int = 256,
                  multiview_input: bool = False, main_in_channels: int = 3, multiview_branch_channels: int = 16,
-                 multiview_channels: int = 64, multiview_planes=None, multiview_fusion: str = "concat"):
+                 multiview_channels: int = 64, multiview_planes=None, multiview_fusion: str = "concat",
+                 multiview_pyramid: bool = False):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -335,6 +385,8 @@ class UNet2D(nn.Module):
                                 or in_channels % 2 == 0):
             raise ValueError("multiview_input cần multiscale_input=False, in_channels và main_in_channels lẻ, "
                              "main_in_channels <= in_channels")
+        if multiview_pyramid and (not multiview_input or multiview_fusion != "concat"):
+            raise ValueError("multiview_pyramid cần multiview_input=True và multiview_fusion=concat")
         if mixture_head and not structure_guided:
             raise ValueError("mixture_head cần structure_guided=True")
         if mixture_head and out_channels != 1:
@@ -371,10 +423,16 @@ class UNet2D(nn.Module):
             for proj in self.ms_proj:
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
-        if multiview_input:
+        self.multiview_pyramid = multiview_pyramid
+        if multiview_pyramid:
+            self.mv_extract = MultiViewPyramid(in_channels, multiview_branch_channels, multiview_channels, depth,
+                                               multiview_planes)
+            self.mv_proj = nn.ModuleList(nn.Conv2d(c, ch, 1) for c, ch in zip(self.mv_extract.out_channels, chs[:-1]))
+        elif multiview_input:
             self.mv_extract = MultiViewExtractor(in_channels, multiview_branch_channels, multiview_channels,
                                                  multiview_planes, multiview_fusion)
             self.mv_proj = nn.ModuleList(nn.Conv2d(multiview_channels, ch, 1) for ch in chs[:-1])
+        if multiview_input:
             for proj in self.mv_proj:
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
@@ -397,6 +455,10 @@ class UNet2D(nn.Module):
                 self.out.bias.copy_(torch.tensor([(h - lo) / (hi - lo) * 2 - 1 for h in MIXTURE_INIT_HU]))
         if structure_guided:
             self.struct_head = nn.Conv2d(chs[0], n_cls, 1)
+
+    def _side_feature(self, feat, s: int) -> torch.Tensor:
+        """Đặc trưng nhánh phụ ở độ phân giải H/2^s: lấy tầng s của pyramid, hoặc AvgPool F độ phân giải đầy đủ."""
+        return feat[s - 1] if self.multiview_pyramid else F.avg_pool2d(feat, 2**s)
 
     def forward(self, x: torch.Tensor, return_struct: bool = False, region=None):
         """return_struct=True (structure_guided hoặc tissue_film): trả thêm list (tầng l, logit cấu trúc).
@@ -423,12 +485,12 @@ class UNet2D(nn.Module):
         skips = []
         for s, block in enumerate(self.down):
             if feat is not None and s > 0:
-                x = x + proj[s - 1](F.avg_pool2d(feat, 2**s))
+                x = x + proj[s - 1](self._side_feature(feat, s))
             x = block(x)
             skips.append(x)
             x = self.pool(x)
         if feat is not None:
-            x = x + proj[-1](F.avg_pool2d(feat, 2**self.depth))
+            x = x + proj[-1](self._side_feature(feat, self.depth))
         x = self.bottom_attn(self.bottom(x))
         film_logits = []
         for i, (up, dec, gate, skip) in enumerate(zip(self.up, self.dec, self.gates, reversed(skips))):

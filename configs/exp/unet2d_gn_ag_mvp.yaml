@@ -1,0 +1,12 @@
+# unet2d_gn_ag_mv với nhánh multi-view phân cấp (multiview_pyramid): mỗi mặt cắt là 1 encoder 3D dẹt giảm 2x theo H, W
+# mỗi tầng; tầng s cho F_s riêng cộng vào tầng encoder s, thay vì AvgPool 1 F độ phân giải đầy đủ.
+# So với unet2d_gn_ag_mv (MAE test 68.69, seed 42); loss L1 thường, còn lại giữ nguyên.
+run_name: unet2d_gn_ag_mvp
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true
+  multiview_pyramid: true

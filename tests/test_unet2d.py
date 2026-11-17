@@ -3,7 +3,7 @@ import pytest
 import torch
 
 from src.models import UNet2D, build_model
-from src.models.unet2d import AdaGroupNorm, RegionFiLMGroupNorm
+from src.models.unet2d import AdaGroupNorm, MultiViewPyramid, RegionFiLMGroupNorm
 from src.utils.config import load_config
 
 
@@ -392,3 +392,35 @@ def test_multiview_attention_fusion():
 def test_multiview_fusion_invalid():
     with pytest.raises(ValueError):
         UNet2D(in_channels=9, norm="group", multiview_input=True, multiview_fusion="sum")
+
+
+def test_multiview_pyramid():
+    torch.manual_seed(0)
+    ag = UNet2D(base_channels=8, depth=3, norm="group", attention_gates=True)
+    kw = dict(in_channels=9, base_channels=8, depth=3, norm="group", attention_gates=True, multiview_input=True,
+              multiview_branch_channels=4, multiview_channels=8)
+    pyr = UNet2D(**kw, multiview_pyramid=True)
+    # Proj khởi tạo 0: cùng trọng số phần chung thì đầu ra giống UNet chỉ nhận 3 lát giữa
+    missing = pyr.load_state_dict(ag.state_dict(), strict=False).missing_keys
+    assert missing and all(k.startswith(("mv_extract", "mv_proj")) for k in missing)
+    x = torch.randn(2, 9, 32, 32)
+    assert torch.allclose(pyr(x), ag(x[:, 3:6]), atol=1e-6)
+    ext = pyr.mv_extract
+    feats = ext(x)
+    assert ext.branch_channels == [4, 8, 16, 32] and ext.out_channels == [8, 16, 32]
+    assert [tuple(f.shape) for f in feats] == [(2, 8, 16, 16), (2, 16, 8, 8), (2, 32, 4, 4)]
+    assert [b[0].kernel_size for b in ext.stages[2].values()] == [(1, 3, 3), (3, 1, 3), (3, 3, 1)]
+    # tầng sâu nhìn được lát ngoài 3 lát giữa
+    x2 = x.clone()
+    x2[:, 0] += 1
+    assert not torch.allclose(ext(x)[-1], ext(x2)[-1])
+    pyr(x).mean().backward()
+    assert all(p.weight.grad.abs().sum() > 0 for p in pyr.mv_proj)
+    # giới hạn kênh, chọn mặt cắt
+    small = UNet2D(**kw, multiview_pyramid=True, multiview_planes=["axial"]).mv_extract
+    assert list(small.stages[0]) == ["axial"]
+    capped = MultiViewPyramid(9, 16, 64, 4, max_branch=32, max_out=128)
+    assert capped.branch_channels == [16, 32, 32, 32, 32] and capped.out_channels == [64, 128, 128, 128]
+    for bad in (dict(multiview_input=False, in_channels=3), dict(multiview_fusion="attention")):
+        with pytest.raises(ValueError):
+            UNet2D(**(kw | dict(multiview_pyramid=True) | bad))
