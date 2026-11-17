@@ -1,0 +1,11 @@
+# unet2d_gn_ag_mv (multi-view 3 mặt cắt) + L1 có trọng số ở xương (bone_weight 2): kết hợp 2 cải tiến.
+run_name: unet2d_gn_ag_mv_bw2
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true
+method:
+  bone_weight: 2.0
