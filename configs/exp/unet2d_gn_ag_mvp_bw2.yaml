@@ -1,0 +1,13 @@
+# unet2d_gn_ag_mvp (multi-view phân cấp) + L1 có trọng số ở xương (bone_weight 2): kết hợp 2 cải tiến.
+# So với unet2d_gn_ag_mvp (MAE test 67.77) và unet2d_gn_ag_mv_bw2 (68.52), seed 42.
+run_name: unet2d_gn_ag_mvp_bw2
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true
+  multiview_pyramid: true
+method:
+  bone_weight: 2.0
