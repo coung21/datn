@@ -11,13 +11,15 @@ Nhãn s lấy từ CT bằng ngưỡng HU (khí < -400, xương > 200), hạ ph�
 bone_weight > 0: loss tái tạo có trọng số theo điểm ảnh, tăng ở xương và dải biên xương:
     w = 1 + bone_weight tại vùng (CT > bone_threshold HU) đã giãn bone_dilate điểm ảnh, w = 1 ở chỗ khác
     L = sum(w |sCT - CT| M) / sum(w M)
+bone_weight có thể là số (chung) hoặc dict theo vùng, vd {brain: 2.0, pelvis: 0.0}: mỗi mẫu dùng lambda của vùng mình
+(vùng thiếu trong dict coi là 0).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..data.preprocess import CT_CLIP
+from ..data.preprocess import CT_CLIP, REGION_IDS
 from .base import Method, masked_l1, masked_mse
 
 LOSSES = {"l1": masked_l1, "l2": masked_mse}
@@ -52,8 +54,11 @@ def structure_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tenso
     return ce + 0.5 * dice
 
 
-def bone_weight_map(ct: torch.Tensor, weight: float, threshold: float = 200.0, dilate: int = 2) -> torch.Tensor:
-    """CT [N,1,H,W] ở thang [-1, 1] -> trọng số [N,1,H,W]: 1 + weight ở xương (CT > threshold HU) đã giãn `dilate` px."""
+def bone_weight_map(ct: torch.Tensor, weight, threshold: float = 200.0, dilate: int = 2) -> torch.Tensor:
+    """CT [N,1,H,W] ở thang [-1, 1] -> trọng số [N,1,H,W]: 1 + weight ở xương (CT > threshold HU) đã giãn `dilate` px.
+    weight: số, hoặc tensor [N] (lambda riêng từng mẫu)."""
+    if torch.is_tensor(weight):
+        weight = weight.to(ct.device, ct.dtype).reshape(-1, 1, 1, 1)
     lo, hi = CT_CLIP
     bone = ((ct + 1) / 2 * (hi - lo) + lo > threshold).float()
     if dilate > 0:
@@ -70,13 +75,22 @@ class Regression(Method):
     extra_in_channels = 0
 
     def __init__(self, loss: str = "l1", struct_weight: float = 0.0, struct_thresholds=(-400.0, 200.0),
-                 bone_weight: float = 0.0, bone_threshold: float = 200.0, bone_dilate: int = 2):
+                 bone_weight=0.0, bone_threshold: float = 200.0, bone_dilate: int = 2):
         if loss not in LOSSES:
             raise ValueError(f"loss '{loss}' không có, chọn trong {sorted(LOSSES)}")
         self.loss_name = loss
         self.struct_weight = float(struct_weight)
         self.struct_thresholds = tuple(struct_thresholds)
-        self.bone_weight = float(bone_weight)
+        if isinstance(bone_weight, dict):
+            unknown = set(bone_weight) - set(REGION_IDS)
+            if unknown:
+                raise ValueError(f"bone_weight: vùng không có {sorted(unknown)}, chọn trong {sorted(REGION_IDS)}")
+            per_region = {r: float(bone_weight.get(r, 0.0)) for r in REGION_IDS}
+        else:
+            per_region = {r: float(bone_weight) for r in REGION_IDS}
+        # lambda theo nhãn vùng (REGION_IDS), dùng chung khi bone_weight là số
+        self.region_bone_weight = torch.tensor([per_region[r] for r in sorted(REGION_IDS, key=REGION_IDS.get)])
+        self.bone_weight = max(per_region.values())  # > 0 khi có ít nhất 1 vùng dùng trọng số
         self.bone_threshold = float(bone_threshold)
         self.bone_dilate = int(bone_dilate)
 
@@ -86,7 +100,12 @@ class Regression(Method):
         plain = fn(pred, batch["ct"], batch["mask"])
         if self.bone_weight <= 0:
             return plain, {self.loss_name: plain.item()}
-        w = bone_weight_map(batch["ct"], self.bone_weight, self.bone_threshold, self.bone_dilate)
+        lam = self.region_bone_weight
+        if lam.unique().numel() == 1:
+            weight = float(lam[0])
+        else:
+            weight = lam[torch.as_tensor(batch["region"], dtype=torch.long).reshape(-1).cpu()]
+        w = bone_weight_map(batch["ct"], weight, self.bone_threshold, self.bone_dilate)
         weighted = fn(pred, batch["ct"], batch["mask"] * w)
         return weighted, {self.loss_name: plain.item(), f"{self.loss_name}_bone": weighted.item()}
 

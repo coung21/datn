@@ -391,3 +391,32 @@ def test_train_bone_weight(tiny_run):
     _, run = tiny_run
     log = pd.read_csv(run("model.norm=group", "method.bone_weight=2.0", "run_name=tiny_bw") / "train_log.csv")
     assert {"loss_l1", "loss_l1_bone"} <= set(log.columns) and (log["loss"] - log["loss_l1_bone"]).abs().max() < 1e-6
+
+
+def test_bone_weight_per_region():
+    from src.methods.regression import bone_weight_map
+
+    def norm(hu):
+        return (hu + 1024) / (3000 + 1024) * 2 - 1
+
+    ct = torch.full((2, 1, 9, 9), norm(0.0))
+    ct[:, 0, 4, 4] = norm(1000.0)
+    w = bone_weight_map(ct, torch.tensor([2.0, 0.0]), 200.0, dilate=0)
+    assert w[0].sum() == 81 + 2 and w[1].eq(1).all()
+
+    class Fixed(torch.nn.Module):
+        def forward(self, x):
+            out = ct.clone()
+            out[:, 0, 4, 4] += 1.0
+            return out
+
+    # mẫu 0 là não (lambda 2, giãn 2 px), mẫu 1 là chậu (lambda 0): tổng sai số 3 + 1, tổng trọng số 131 + 81
+    batch = {"cond": torch.zeros(2, 3, 9, 9), "ct": ct, "mask": torch.ones_like(ct), "region": torch.tensor([0, 1])}
+    loss, logs = Regression(bone_weight={"brain": 2.0, "pelvis": 0.0}).loss(Fixed(), batch)
+    assert torch.isclose(loss, torch.tensor(4 / 212)) and "l1_bone" in logs
+    # dict cùng giá trị cho mọi vùng = số chung; vùng thiếu coi là 0
+    same = Regression(bone_weight={"brain": 2.0, "pelvis": 2.0}).loss(Fixed(), batch)[0]
+    assert torch.isclose(same, Regression(bone_weight=2.0).loss(Fixed(), batch)[0])
+    assert Regression(bone_weight={"pelvis": 0.0}).loss(Fixed(), batch)[1].keys() == {"l1"}
+    with pytest.raises(ValueError):
+        Regression(bone_weight={"head": 2.0})

@@ -1,0 +1,16 @@
+# unet2d_gn_ag_mvp (multi-view phân cấp) + L1 có trọng số ở xương chỉ cho não (lambda 2 não, 0 chậu).
+# Lý do: trọng số xương giúp não nhưng làm chậu kém đi trên cả MV và MV pyramid (unet2d_gn_ag_mvp_bw2: não -1.22,
+# chậu +1.26 so với unet2d_gn_ag_mvp). So với unet2d_gn_ag_mvp (67.77) và unet2d_gn_ag_mvp_bw2 (67.79), seed 42.
+run_name: unet2d_gn_ag_mvp_bwr
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true
+  multiview_pyramid: true
+method:
+  bone_weight:
+    brain: 2.0
+    pelvis: 0.0
