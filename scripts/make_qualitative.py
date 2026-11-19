@@ -15,7 +15,8 @@ Bước 2, ở local (chỉ cần các npz): vẽ hình axial và coronal, mỗi
 
     python -m scripts.make_qualitative plot --dir outputs/hinh_dinh_tinh
 
-Chọn bệnh nhân (nếu không truyền --patients) theo MAE test từng bệnh nhân (eval/test_best/per_patient.csv):
+Chọn bệnh nhân (nếu không truyền --patients) theo MAE test từng bệnh nhân (eval/test_best/per_patient.csv),
+bỏ các ca đặc biệt (cột special):
   - mỗi vùng 1 ca có MAE của mô hình --ref ở trung vị (ca đại diện);
   - ca chậu mà --new cải thiện nhiều nhất so với --ref;
   - ca mà --new kém hơn --ref nhiều nhất.
@@ -34,7 +35,10 @@ REGION_NAMES = {"brain": "brain", "pelvis": "pelvis"}
 
 
 def select_patients(ref: pd.DataFrame, new: pd.DataFrame) -> dict[str, str]:
-    """{id: lý do chọn}. ref, new: per_patient (index id, cột region, mae)."""
+    """{id: lý do chọn}. ref, new: per_patient (index id, cột region, mae, có thể có cột special).
+    Bỏ các ca đặc biệt (special = True, vd có kim loại cấy ghép) vì không đại diện cho đa số."""
+    if "special" in ref.columns:
+        ref = ref[~ref["special"].astype(bool)]
     new = new.loc[ref.index]
     picked: dict[str, str] = {}
     for region in ("brain", "pelvis"):

@@ -118,3 +118,13 @@ def test_draw_ref_diff_and_zoom(tmp_path):
     for zoom in (False, True):
         draw("axial", info, data, tmp_path / f"q{zoom}", zoom=zoom)
         assert (tmp_path / f"q{zoom}.png").stat().st_size > 0
+
+
+def test_select_patients_skips_special():
+    ids = [f"1BA{i:03d}" for i in range(5)] + [f"1PA{i:03d}" for i in range(5)]
+    ref = pd.DataFrame({"region": ["brain"] * 5 + ["pelvis"] * 5,
+                        "mae": [70, 80, 60, 90, 75, 50, 65, 55, 70, 60.0], "special": [False] * 9 + [True]}, index=ids)
+    new = ref.copy()
+    new["mae"] += [0, 1, 0, 8, 0, 0, -9, 0, 0, 0]
+    picked = select_patients(ref, new)
+    assert "1PA004" not in picked and picked["1PA002"] == "median pelvis"
