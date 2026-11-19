@@ -95,3 +95,26 @@ def test_error_region_zones():
     df = pd.DataFrame([{"model": "A", "id": "1BA001", "region": "brain", **r} for r in rows.values()])
     s = summarize(df).set_index("zone")
     assert s.loc["bone_inner", "err_%"] > 99 and s.loc["bone_inner", "bias"] == -100
+
+
+def test_draw_ref_diff_and_zoom(tmp_path):
+    from scripts.make_qualitative import slice_panel, zoom_box
+
+    rng = np.random.default_rng(0)
+    labels = ["A", "B", "C"]
+    info = {"labels": labels, "patients": {"1PA001": "median pelvis"}, "ref": "A", "new": "C",
+            "mae": {"1PA001": {l: 60.0 for l in labels}}}
+    mask = np.zeros((12, 60, 60), np.uint8)
+    mask[2:10, 5:55, 5:55] = 1
+    ct = rng.integers(-1000, 1500, mask.shape).astype(np.int16)
+    sct_a = ct + 100
+    sct_a[:, 40:50, 10:20] += 300  # ref sai nhiều ở góc này, C thì không
+    data = {"1PA001": {"mask": mask, "ct": ct, "mr": rng.uniform(-1, 1, mask.shape).astype(np.float16),
+                       "sct_0": sct_a, "sct_1": ct + 50, "sct_2": ct + 100, "spacing": np.ones(3, np.float32)}}
+    pn = slice_panel("axial", "1PA001", data["1PA001"], 3)
+    ys, xs = zoom_box(pn, 0, 2, size_mm=20)
+    assert ys.stop - ys.start == 20 and xs.stop - xs.start == 20
+    assert ys.start <= 40 - 5 and ys.stop >= 50 - 5 and xs.start <= 10 - 5 and xs.stop >= 20 - 5  # bao chỗ cải thiện
+    for zoom in (False, True):
+        draw("axial", info, data, tmp_path / f"q{zoom}", zoom=zoom)
+        assert (tmp_path / f"q{zoom}.png").stat().st_size > 0

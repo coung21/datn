@@ -9,7 +9,9 @@ Bước 1, trên server (cần GPU và data/processed): chọn bệnh nhân, d�
         --model "Multi-view" outputs/runs/unet2d_gn_ag_mv_<...> \
         --ref "GN + AG" --new "Multi-view" [--patients ID ...] --out outputs/hinh_dinh_tinh
 
-Bước 2, ở local (chỉ cần các npz): vẽ hình axial và coronal
+Bước 2, ở local (chỉ cần các npz): vẽ hình axial và coronal, mỗi hướng 1 hình toàn lát và 1 hình phóng to
+(ZOOM_MM mm quanh chỗ --new giảm sai số nhiều nhất so với --ref trên lát đó). Có thêm hàng hiệu sai số
+|e_mô hình| - |e_ref| (xanh: tốt hơn --ref).
 
     python -m scripts.make_qualitative plot --dir outputs/hinh_dinh_tinh
 
@@ -99,55 +101,110 @@ def export(args):
         print(f"{label}: xong", flush=True)
     for pid, d in data.items():
         np.savez_compressed(out / f"{pid}.npz", **d)
-    info = {"labels": list(runs), "patients": picked,
+    info = {"labels": list(runs), "patients": picked, "ref": args.ref, "new": args.new,
             "mae": {pid: {l: float(per_patient[l].loc[pid, "mae"]) for l in runs} for pid in picked}}
     (out / "info.json").write_text(json.dumps(info, indent=1, ensure_ascii=False))
     print(f"Đã ghi {out}")
 
 
-def draw(view: str, info: dict, data: dict, out_stem: Path) -> None:
+DIFF_LIMIT = 100          # HU, thang bản đồ hiệu sai số |e_mô hình| - |e_ref|
+ZOOM_MM = 80              # cạnh vùng phóng to (mm)
+
+
+def slice_panel(view: str, pid: str, d, n_models: int) -> dict:
+    """Lát giữa (theo mask) của 1 bệnh nhân, cắt sát khung mask: MR, CT, các sCT và tỉ lệ khung."""
+    sx, sy, sz = (float(s) for s in d["spacing"])
+    index = middle_index(d["mask"], 0 if view == "axial" else 1)
+    cut = lambda v: take_view(np.asarray(v), view, index)  # noqa: E731
+    mask = cut(d["mask"]) > 0
+    ys, xs = np.flatnonzero(mask.any(1)), np.flatnonzero(mask.any(0))
+    box = (slice(ys[0], ys[-1] + 1), slice(xs[0], xs[-1] + 1))
+    return {"pid": pid, "aspect": sy / sx if view == "axial" else sz / sx, "px_mm": (sy if view == "axial" else sz, sx),
+            "mask": mask[box], "mr": cut(d["mr"]).astype(np.float32)[box], "ct": cut(d["ct"]).astype(np.float32)[box],
+            "sct": [cut(d[f"sct_{i}"]).astype(np.float32)[box] for i in range(n_models)]}
+
+
+def zoom_box(pn: dict, ref: int, new: int, size_mm: float = ZOOM_MM) -> tuple[slice, slice]:
+    """Khung size_mm x size_mm quanh chỗ --new giảm sai số nhiều nhất so với --ref (trung bình trượt trong mask)."""
+    from scipy.ndimage import uniform_filter
+
+    gain = np.where(pn["mask"], np.abs(pn["sct"][ref] - pn["ct"]) - np.abs(pn["sct"][new] - pn["ct"]), 0.0)
+    h, w = gain.shape
+    size = [min(int(round(size_mm / mm)), n) for mm, n in zip(pn["px_mm"], (h, w))]
+    smooth = uniform_filter(gain, size=[max(s // 2, 1) for s in size], mode="constant")
+    cy, cx = np.unravel_index(np.argmax(smooth), smooth.shape)
+    y0 = int(np.clip(cy - size[0] // 2, 0, h - size[0]))
+    x0 = int(np.clip(cx - size[1] // 2, 0, w - size[1]))
+    return slice(y0, y0 + size[0]), slice(x0, x0 + size[1])
+
+
+def crop_panel(pn: dict, box) -> dict:
+    out = dict(pn)
+    for k in ("mask", "mr", "ct"):
+        out[k] = pn[k][box]
+    out["sct"] = [s[box] for s in pn["sct"]]
+    return out
+
+
+def draw(view: str, info: dict, data: dict, out_stem: Path, zoom: bool = False) -> None:
+    """Mỗi bệnh nhân: hàng ảnh (MRI, CT, sCT), hàng bản đồ sai số và, nếu info có "ref", hàng hiệu sai số
+    |e_mô hình| - |e_ref| (xanh: tốt hơn mô hình ref). zoom=True: chỉ vẽ vùng ZOOM_MM quanh chỗ info["new"]
+    cải thiện nhiều nhất so với ref trên lát đó."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     labels, pids = info["labels"], list(info["patients"])
+    ref = labels.index(info["ref"]) if info.get("ref") in labels else None
+    new = labels.index(info["new"]) if info.get("new") in labels else len(labels) - 1
+    if zoom and ref is None:
+        raise ValueError("zoom cần info['ref']")
+    per = 3 if ref is not None else 2
     n_col = 2 + len(labels)
     panels, heights = [], []
     for pid in pids:
-        d = data[pid]
-        sx, sy, sz = (float(s) for s in d["spacing"])
-        index = middle_index(d["mask"], 0 if view == "axial" else 1)
-        aspect = sy / sx if view == "axial" else sz / sx
-        cut = lambda v: take_view(np.asarray(v), view, index)  # noqa: E731
-        mask = cut(d["mask"]) > 0
-        ys, xs = np.flatnonzero(mask.any(1)), np.flatnonzero(mask.any(0))
-        box = (slice(ys[0], ys[-1] + 1), slice(xs[0], xs[-1] + 1))
-        panels.append({"pid": pid, "aspect": aspect, "mask": mask[box], "mr": cut(d["mr"]).astype(np.float32)[box],
-                       "ct": cut(d["ct"]).astype(np.float32)[box],
-                       "sct": [cut(d[f"sct_{i}"]).astype(np.float32)[box] for i in range(len(labels))]})
-        h, w = panels[-1]["mask"].shape
-        heights.append(h * aspect / w)
+        pn = slice_panel(view, pid, data[pid], len(labels))
+        if zoom:
+            pn = crop_panel(pn, zoom_box(pn, ref, new))
+        panels.append(pn)
+        h, w = pn["mask"].shape
+        heights.append(h * pn["aspect"] / w)
 
     col_w = 2.0
-    ratios = [h for h in heights for _ in range(2)]
-    fig, axes = plt.subplots(2 * len(pids), n_col, figsize=(col_w * n_col + 0.7, col_w * sum(ratios) + 0.5),
+    ratios = [h for h in heights for _ in range(per)]
+    fig, axes = plt.subplots(per * len(pids), n_col, figsize=(col_w * n_col + 0.7, col_w * sum(ratios) + 0.5),
                              gridspec_kw={"height_ratios": ratios, "wspace": 0.03, "hspace": 0.05}, squeeze=False)
     fig.patch.set_facecolor("black")
-    im_ct = im_err = None
+    im_ct = im_err = im_diff = None
     for r, pn in enumerate(panels):
-        top, bot = axes[2 * r], axes[2 * r + 1]
+        top, bot = axes[per * r], axes[per * r + 1]
         kw = {"aspect": pn["aspect"], "interpolation": "nearest"}
         top[0].imshow(pn["mr"], cmap="gray", vmin=-1, vmax=1, **kw)
         im_ct = top[1].imshow(pn["ct"], cmap="gray", vmin=CT_WINDOW[0], vmax=CT_WINDOW[1], **kw)
+        err_ref = None if ref is None else np.abs(pn["sct"][ref] - pn["ct"])
         for c, (label, sct) in enumerate(zip(labels, pn["sct"])):
             top[2 + c].imshow(sct, cmap="gray", vmin=CT_WINDOW[0], vmax=CT_WINDOW[1], **kw)
             err = np.where(pn["mask"], sct - pn["ct"], np.nan)
             im_err = bot[2 + c].imshow(err, cmap="RdBu_r", vmin=-ERR_LIMIT, vmax=ERR_LIMIT, **kw)
-            bot[2 + c].text(0.5, 0.02, f"MAE {info['mae'][pn['pid']][label]:.1f} HU", color="black", fontsize=7,
-                            ha="center", va="bottom", transform=bot[2 + c].transAxes,
+            if zoom:
+                text = f"MAE {np.nanmean(np.abs(err)):.1f} HU (zoom)"
+            else:
+                text = f"MAE {info['mae'][pn['pid']][label]:.1f} HU"
+            bot[2 + c].text(0.5, 0.02, text, color="black", fontsize=7, ha="center", va="bottom",
+                            transform=bot[2 + c].transAxes,
                             bbox={"facecolor": "white", "alpha": 0.8, "pad": 1.5, "edgecolor": "none"})
+            if ref is not None:
+                ax = axes[per * r + 2][2 + c]
+                if c == ref:
+                    ax.text(0.5, 0.5, "ref", color="white", fontsize=9, ha="center", va="center", transform=ax.transAxes)
+                else:
+                    diff = np.where(pn["mask"], np.abs(sct - pn["ct"]) - err_ref, np.nan)
+                    im_diff = ax.imshow(diff, cmap="RdBu_r", vmin=-DIFF_LIMIT, vmax=DIFF_LIMIT, **kw)
         bot[0].text(0.03, 0.95, f"{pn['pid']}\n{info['patients'][pn['pid']]}", color="white", fontsize=8,
                     ha="left", va="top", transform=bot[0].transAxes)
+        if ref is not None:
+            axes[per * r + 2][0].text(0.03, 0.95, f"|e| − |e {info['ref']}|", color="white", fontsize=8,
+                                      ha="left", va="top", transform=axes[per * r + 2][0].transAxes)
         if r == 0:
             for ax, title in zip(top, ["MRI", "Ground truth CT", *labels]):
                 ax.set_title(title, color="white", fontsize=9)
@@ -156,8 +213,10 @@ def draw(view: str, info: dict, data: dict, out_stem: Path) -> None:
         ax.set_facecolor("black")
         for s in ax.spines.values():
             s.set_visible(False)
-    for im, label, y in ((im_ct, "HU", 0.55), (im_err, "sCT − CT (HU)", 0.12)):
-        cax = fig.add_axes([0.925, y, 0.012, 0.3])
+    bars = [(im_ct, "HU"), (im_err, "sCT − CT (HU)")] + ([(im_diff, "|e| − |e ref| (HU)")] if im_diff is not None else [])
+    step = 0.9 / len(bars)
+    for k, (im, label) in enumerate(bars):
+        cax = fig.add_axes([0.925, 0.96 - step * (k + 1) + 0.04, 0.012, step - 0.08])
         cb = fig.colorbar(im, cax=cax)
         cb.set_label(label, color="white", fontsize=8)
         cb.ax.tick_params(colors="white", labelsize=7)
@@ -174,6 +233,8 @@ def plot(args):
     data = {pid: np.load(d / f"{pid}.npz") for pid in info["patients"]}
     for view in ("axial", "coronal"):
         draw(view, info, data, d / f"qualitative_{view}")
+        if info.get("ref") in info["labels"]:
+            draw(view, info, data, d / f"qualitative_{view}_zoom", zoom=True)
 
 
 def main():
