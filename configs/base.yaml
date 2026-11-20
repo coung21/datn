@@ -36,7 +36,7 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   base_channels: 64                 # 64 -> 128 -> 256 -> 512 -> 1024 (đáy)
   depth: 4                          # số lần giảm kích thước, patch phải chia hết cho 2^depth
   norm: batch                       # batch | instance | group
-  block: conv                       # conv: 2 x [Conv-Norm-ReLU] | res: ResBlock cùng số conv
+  block: conv                       # conv: 2 x [Conv-Norm-ReLU] | res: ResBlock cùng số conv | mednext: khối MedNeXt 2D
   attention_gates: false            # true: attention gate trên mỗi skip (Attention U-Net)
   bottleneck_attention: false       # true: 1 khối self-attention ở bottleneck (16x16 với patch 256)
   attention_head_channels: 64       # 1024 kênh / 64 = 16 head
@@ -57,6 +57,10 @@ model:                              # UNet 2.5D cổ điển (src/models/unet2d.
   multiview_planes: [axial, coronal, sagittal]   # các mặt cắt có nhánh (ablation: bỏ bớt)
   multiview_fusion: concat          # concat | attention (trọng số theo vị trí cho từng mặt cắt trước khi ghép)
   multiview_pyramid: false         # nhánh multi-view phân cấp: mỗi tầng encoder có F_s riêng (trường nhìn tăng theo tầng)
+  mednext_kernel: 7                 # block=mednext: kernel depthwise của khối, khối xuống và khối lên
+  mednext_expansion: [2, 4, 4, 4, 2]  # hệ số mở rộng R theo tầng 0..depth (cuối là bottleneck)
+  mednext_blocks: 2                 # số khối MedNeXt mỗi tầng
+  mednext_checkpoint: false         # gradient checkpointing từng khối khi train (tiết kiệm VRAM, chậm hơn)
 
 method:
   name: regression

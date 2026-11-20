@@ -424,3 +424,46 @@ def test_multiview_pyramid():
     for bad in (dict(multiview_input=False, in_channels=3), dict(multiview_fusion="attention")):
         with pytest.raises(ValueError):
             UNet2D(**(kw | dict(multiview_pyramid=True) | bad))
+
+
+def test_mednext_blocks():
+    from src.models.unet2d import MedNeXtBlock, MedNeXtDown, MedNeXtStage, MedNeXtUp
+    torch.manual_seed(0)
+    blk = MedNeXtBlock(16, "group", kernel=7, expansion=4)
+    x = torch.randn(2, 16, 16, 16)
+    assert torch.allclose(blk(x), x + blk.body(x))
+    assert blk.body[0].groups == 16 and blk.body[0].kernel_size == (7, 7) and blk.body[2].out_channels == 64
+    stage = MedNeXtStage(8, 16, "group", kernel=5, expansion=2, n_blocks=3)
+    assert stage(torch.randn(2, 8, 16, 16)).shape == (2, 16, 16, 16) and len(stage.blocks) == 3
+    assert isinstance(MedNeXtStage(16, 16, "group").stem, torch.nn.Identity)
+    assert MedNeXtDown(16, 16, "group")(x).shape == (2, 16, 8, 8)
+    assert MedNeXtUp(32, 16, "group")(torch.randn(2, 32, 8, 8)).shape == (2, 16, 16, 16)
+    # checkpoint cho cùng kết quả và gradient
+    a = MedNeXtStage(16, 16, "group")
+    b = MedNeXtStage(16, 16, "group", checkpoint=True)
+    b.load_state_dict(a.state_dict())
+    xa, xb = x.clone().requires_grad_(), x.clone().requires_grad_()
+    a(xa).square().mean().backward()
+    b(xb).square().mean().backward()
+    assert torch.allclose(xa.grad, xb.grad, atol=1e-6)
+
+
+def test_mednext_unet():
+    torch.manual_seed(0)
+    model = UNet2D(in_channels=9, base_channels=8, depth=3, norm="group", attention_gates=True, multiview_input=True,
+                   multiview_pyramid=True, block="mednext", mednext_expansion=(2, 4, 4, 2))
+    out = model(torch.randn(2, 9, 32, 32))
+    assert out.shape == (2, 1, 32, 32) and torch.isfinite(out).all()
+    out.mean().backward()
+    assert all(p.grad is not None for n, p in model.named_parameters() if not n.startswith("mv_extract"))
+    with pytest.raises(ValueError):
+        UNet2D(base_channels=8, depth=3, block="mednext", mednext_expansion=(2, 4))
+    # config cũ: pool là MaxPool không tham số, state_dict không đổi
+    assert all(not k.startswith("pool") for k in UNet2D(base_channels=8, depth=3).state_dict())
+
+
+def test_gn_ag_mvp_mednext_config():
+    cfg = load_config("configs/base.yaml", "configs/exp/unet2d_gn_ag_mvp_mednext.yaml")["model"]
+    model = build_model(cfg)
+    n = sum(p.numel() for p in model.parameters())
+    assert cfg["block"] == "mednext" and 32e6 <= n <= 35e6, f"{n / 1e6:.2f}M"

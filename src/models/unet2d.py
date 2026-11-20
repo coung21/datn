@@ -61,6 +61,14 @@ block="res": thay mỗi ConvBlock bằng 1 ResBlock (basic block của ResNet, H
     y = ReLU(Norm(Conv3x3(ReLU(Norm(Conv3x3(x))))) + shortcut(x)),
 shortcut là x, hoặc Conv1x1 + Norm khi số kênh vào khác ra.
 
+block="mednext": backbone kiểu MedNeXt (Roy et al. 2023), bản 2D. Mỗi tầng = Conv1x1 đổi số kênh (khi vào khác ra)
+rồi mednext_blocks khối residual inverted bottleneck:
+    y = x + Conv1x1_{RC->C}(GELU(Conv1x1_{C->RC}(Norm(DWConv_kxk(x)))))
+R = mednext_expansion[s] theo tầng s. MaxPool thay bằng khối xuống cùng kiểu (DWConv k stride 2, nhánh tắt
+Conv1x1 stride 2), ConvTranspose thay bằng khối lên (DWConvTranspose k stride 2, nhánh tắt nội suy nearest + Conv1x1);
+khối lên/xuống giữ số kênh của tầng đích/nguồn nên chỗ inject nhánh phụ và attention gate không đổi.
+mednext_checkpoint=True: gradient checkpointing từng khối khi train (tiết kiệm VRAM, chậm hơn).
+
 bottleneck_attention=True: thêm 1 khối self-attention đa đầu sau ConvBlock ở bottleneck (kiểu ADM):
     h = x + Proj(MHSA(Norm(x)))
 mỗi vị trí 16x16 (patch 256) là 1 token; qkv và Proj là Conv1x1, Proj khởi tạo 0 nên lúc đầu khối là
@@ -70,6 +78,7 @@ hàm đồng nhất. Không positional encoding, không FFN.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from ..data.preprocess import CT_CLIP
 
@@ -110,7 +119,73 @@ class ResBlock(nn.Module):
         return torch.relu(self.body(x) + self.shortcut(x))
 
 
-BLOCKS = {"conv": ConvBlock, "res": ResBlock}
+class MedNeXtBlock(nn.Module):
+    """x + Conv1x1(GELU(Conv1x1_expand(Norm(DWConv_kxk(x))))) — khối residual inverted bottleneck của MedNeXt."""
+
+    def __init__(self, ch: int, norm: str, kernel: int = 7, expansion: int = 4):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(ch, ch, kernel, padding=kernel // 2, groups=ch), make_norm(norm, ch),
+            nn.Conv2d(ch, expansion * ch, 1), nn.GELU(), nn.Conv2d(expansion * ch, ch, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class MedNeXtStage(nn.Module):
+    """Conv1x1 đổi số kênh (khi in_ch != out_ch) rồi n_blocks khối MedNeXt; checkpoint: gradient checkpointing."""
+
+    def __init__(self, in_ch: int, out_ch: int, norm: str, kernel: int = 7, expansion: int = 4, n_blocks: int = 2,
+                 checkpoint: bool = False):
+        super().__init__()
+        self.stem = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1)
+        self.blocks = nn.ModuleList(MedNeXtBlock(out_ch, norm, kernel, expansion) for _ in range(n_blocks))
+        self.checkpoint = checkpoint
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        for b in self.blocks:
+            if self.checkpoint and self.training and torch.is_grad_enabled():
+                x = torch.utils.checkpoint.checkpoint(b, x, use_reentrant=False)
+            else:
+                x = b(x)
+        return x
+
+
+class MedNeXtDown(nn.Module):
+    """Giảm 2x: DWConv kxk stride 2 -> Norm -> Conv1x1 expand -> GELU -> Conv1x1, cộng nhánh tắt Conv1x1 stride 2."""
+
+    def __init__(self, in_ch: int, out_ch: int, norm: str, kernel: int = 7, expansion: int = 4):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, kernel, stride=2, padding=kernel // 2, groups=in_ch), make_norm(norm, in_ch),
+            nn.Conv2d(in_ch, expansion * in_ch, 1), nn.GELU(), nn.Conv2d(expansion * in_ch, out_ch, 1),
+        )
+        self.shortcut = nn.Conv2d(in_ch, out_ch, 1, stride=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.body(x) + self.shortcut(x)
+
+
+class MedNeXtUp(nn.Module):
+    """Tăng 2x: DWConvTranspose kxk stride 2 -> Norm -> Conv1x1 expand -> GELU -> Conv1x1,
+    cộng nhánh tắt Conv1x1(nearest 2x). expansion tính trên out_ch (tầng đích) để khối rẻ ở tầng sâu."""
+
+    def __init__(self, in_ch: int, out_ch: int, norm: str, kernel: int = 7, expansion: int = 4):
+        super().__init__()
+        hidden = expansion * out_ch
+        self.body = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, in_ch, kernel, stride=2, padding=kernel // 2, output_padding=1, groups=in_ch),
+            make_norm(norm, in_ch), nn.Conv2d(in_ch, hidden, 1), nn.GELU(), nn.Conv2d(hidden, out_ch, 1),
+        )
+        self.shortcut = nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv2d(in_ch, out_ch, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.body(x) + self.shortcut(x)
+
+
+BLOCKS = {"conv": ConvBlock, "res": ResBlock, "mednext": MedNeXtStage}
 
 
 class AttentionGate(nn.Module):
@@ -369,7 +444,8 @@ class UNet2D(nn.Module):
                  region_adagn: bool = False, region_emb_channels: int = 256,
                  multiview_input: bool = False, main_in_channels: int = 3, multiview_branch_channels: int = 16,
                  multiview_channels: int = 64, multiview_planes=None, multiview_fusion: str = "concat",
-                 multiview_pyramid: bool = False):
+                 multiview_pyramid: bool = False, mednext_kernel: int = 7, mednext_expansion=(2, 4, 4, 4, 2),
+                 mednext_blocks: int = 2, mednext_checkpoint: bool = False):
         super().__init__()
         if block not in BLOCKS:
             raise ValueError(f"block '{block}' không có, chọn {' | '.join(BLOCKS)}")
@@ -391,6 +467,9 @@ class UNet2D(nn.Module):
             raise ValueError("mixture_head cần structure_guided=True")
         if mixture_head and out_channels != 1:
             raise ValueError("mixture_head chỉ hỗ trợ out_channels=1")
+        mednext = block == "mednext"
+        if mednext and len(mednext_expansion) != depth + 1:
+            raise ValueError(f"mednext_expansion cần depth + 1 = {depth + 1} giá trị, nhận {len(mednext_expansion)}")
         Block = BLOCKS[block]
         if region_adagn:
             Block = lambda i, o, _norm: AdaGNConvBlock(i, o, region_emb_channels)  # noqa: E731
@@ -403,6 +482,14 @@ class UNet2D(nn.Module):
         self.needs_region = region_film or region_adagn
         block_norm = "region_group" if region_film else norm  # chỉ GN trong các khối conv đổi theo vùng
         chs = [base_channels * 2**i for i in range(depth + 1)]  # 64, 128, 256, 512, 1024
+        mx = dict(kernel=mednext_kernel)
+
+        def stage(s: int, i: int, o: int) -> nn.Module:
+            """Khối conv của tầng s (0..depth, depth là bottleneck)."""
+            if mednext:
+                return MedNeXtStage(i, o, block_norm, expansion=mednext_expansion[s], n_blocks=mednext_blocks,
+                                    checkpoint=mednext_checkpoint, **mx)
+            return Block(i, o, block_norm)
 
         self.down = nn.ModuleList()
         self.multiview_input = multiview_input
@@ -410,10 +497,12 @@ class UNet2D(nn.Module):
         self.main_slice = (slice((in_channels - main_in_channels) // 2, (in_channels + main_in_channels) // 2)
                            if multiview_input else slice(None))
         prev = main_in_channels if multiview_input else in_channels
-        for ch in chs[:-1]:
-            self.down.append(Block(prev, ch, block_norm))
+        for s, ch in enumerate(chs[:-1]):
+            self.down.append(stage(s, prev, ch))
             prev = ch
-        self.pool = nn.MaxPool2d(2)
+        # MaxPool không có tham số nên state_dict của các config cũ không đổi
+        self.pool = nn.ModuleList(MedNeXtDown(ch, ch, norm, expansion=mednext_expansion[s], **mx) if mednext
+                                  else nn.MaxPool2d(2) for s, ch in enumerate(chs[:-1]))
         self.multiscale_input = multiscale_input
         if multiscale_input:
             self.ms_extract = MultiScaleExtractor(in_channels, multiscale_branch_channels, multiscale_channels,
@@ -436,14 +525,16 @@ class UNet2D(nn.Module):
             for proj in self.mv_proj:
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
-        self.bottom = Block(chs[-2], chs[-1], block_norm)
+        self.bottom = stage(depth, chs[-2], chs[-1])
         self.bottom_attn = (SelfAttention2d(chs[-1], attention_head_channels, norm) if bottleneck_attention
                             else nn.Identity())
 
         self.up, self.dec, self.gates = nn.ModuleList(), nn.ModuleList(), nn.ModuleList()
-        for ch in reversed(chs[:-1]):
-            self.up.append(nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
-            self.dec.append(TissueFiLMConvBlock(ch * 2, ch) if tissue_film else Block(ch * 2, ch, block_norm))
+        for s in reversed(range(depth)):
+            ch = chs[s]
+            self.up.append(MedNeXtUp(ch * 2, ch, norm, expansion=mednext_expansion[s], **mx) if mednext
+                           else nn.ConvTranspose2d(ch * 2, ch, 2, stride=2))
+            self.dec.append(TissueFiLMConvBlock(ch * 2, ch) if tissue_film else stage(s, ch * 2, ch))
             self.gates.append(Gate(ch, norm) if attention_gates else nn.Identity())
         n_cls = StructureGuidedGate.N_CLASSES
         if tissue_film:
@@ -488,7 +579,7 @@ class UNet2D(nn.Module):
                 x = x + proj[s - 1](self._side_feature(feat, s))
             x = block(x)
             skips.append(x)
-            x = self.pool(x)
+            x = self.pool[s](x)
         if feat is not None:
             x = x + proj[-1](self._side_feature(feat, self.depth))
         x = self.bottom_attn(self.bottom(x))

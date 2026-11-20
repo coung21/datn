@@ -1,0 +1,13 @@
+# unet2d_gn_ag_mvp với backbone MedNeXt 2D (block: mednext): mỗi tầng 2 khối DWConv 7x7 -> GN -> Conv1x1 mở rộng R
+# -> GELU -> Conv1x1 (residual), MaxPool / ConvTranspose thay bằng khối xuống / lên cùng kiểu. R = [2, 4, 4, 4, 2]
+# để số tham số (33.3M) gần MVP (35.0M). So với unet2d_gn_ag_mvp (MAE test 67.77, seed 42); còn lại giữ nguyên.
+run_name: unet2d_gn_ag_mvp_mednext
+data:
+  context_slices: 4
+model:
+  in_channels: 9
+  norm: group
+  attention_gates: true
+  multiview_input: true
+  multiview_pyramid: true
+  block: mednext
