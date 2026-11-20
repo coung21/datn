@@ -11,3 +11,6 @@ model:
   multiview_input: true
   multiview_pyramid: true
   block: mednext
+train:
+  batch_size: 4                     # batch 8 hết VRAM (16 GB); 4 x accum 8 giữ batch hiệu dụng 32, GN không phụ thuộc batch
+  grad_accum: 8                     # 11.6 img/s, nhanh hơn checkpoint ở batch 8 (10.7 img/s)
