@@ -115,10 +115,30 @@ DIFF_LIMIT = 100          # HU, thang bản đồ hiệu sai số |e_mô hình| 
 ZOOM_MM = 80              # cạnh vùng phóng to (mm)
 
 
-def slice_panel(view: str, pid: str, d, n_models: int) -> dict:
-    """Lát giữa (theo mask) của 1 bệnh nhân, cắt sát khung mask: MR, CT, các sCT và tỉ lệ khung."""
+def gain_index(d, axis: int, ref: int, new: int, trim: float = 0.15, smooth: int = 7) -> int:
+    """Lát theo trục axis mà --new giảm MAE nhiều nhất so với --ref (trung bình trượt `smooth` lát),
+    chỉ xét lát có diện tích mask >= 50% lớn nhất và bỏ `trim` mỗi đầu (lát biên thiếu ngữ cảnh)."""
+    from scipy.ndimage import uniform_filter1d
+
+    m = d["mask"] > 0
+    ct = d["ct"].astype(np.float32)
+    gain = np.where(m, np.abs(d[f"sct_{ref}"] - ct) - np.abs(d[f"sct_{new}"] - ct), 0.0)
+    other = tuple(a for a in range(3) if a != axis)
+    area = m.sum(other)
+    g = uniform_filter1d(gain.sum(other) / np.maximum(area, 1), smooth)
+    idx = np.flatnonzero(area > 0)
+    k = int(trim * len(idx))
+    ok = area >= 0.5 * area.max()
+    ok[:idx[0] + k] = False
+    ok[idx[-1] - k + 1:] = False
+    return int(np.argmax(np.where(ok, g, -np.inf)))
+
+
+def slice_panel(view: str, pid: str, d, n_models: int, index: int | None = None) -> dict:
+    """Lát `index` (mặc định lát giữa theo mask) của 1 bệnh nhân, cắt sát khung mask: MR, CT, các sCT và tỉ lệ khung."""
     sx, sy, sz = (float(s) for s in d["spacing"])
-    index = middle_index(d["mask"], 0 if view == "axial" else 1)
+    axis = 0 if view == "axial" else 1
+    index = middle_index(d["mask"], axis) if index is None else index
     cut = lambda v: take_view(np.asarray(v), view, index)  # noqa: E731
     mask = cut(d["mask"]) > 0
     ys, xs = np.flatnonzero(mask.any(1)), np.flatnonzero(mask.any(0))
@@ -150,7 +170,7 @@ def crop_panel(pn: dict, box) -> dict:
     return out
 
 
-def draw(view: str, info: dict, data: dict, out_stem: Path, zoom: bool = False) -> None:
+def draw(view: str, info: dict, data: dict, out_stem: Path, zoom: bool = False, slice_by: str = "middle") -> None:
     """Mỗi bệnh nhân: hàng ảnh (MRI, CT, sCT), hàng bản đồ sai số và, nếu info có "ref", hàng hiệu sai số
     |e_mô hình| - |e_ref| (xanh: tốt hơn mô hình ref). zoom=True: chỉ vẽ vùng ZOOM_MM quanh chỗ info["new"]
     cải thiện nhiều nhất so với ref trên lát đó."""
@@ -167,7 +187,11 @@ def draw(view: str, info: dict, data: dict, out_stem: Path, zoom: bool = False) 
     n_col = 2 + len(labels)
     panels, heights = [], []
     for pid in pids:
-        pn = slice_panel(view, pid, data[pid], len(labels))
+        index = None
+        if slice_by == "gain" and ref is not None:
+            index = gain_index(data[pid], 0 if view == "axial" else 1, ref, new)
+            print(f"{pid} {view}: lát {index}")
+        pn = slice_panel(view, pid, data[pid], len(labels), index)
         if zoom:
             pn = crop_panel(pn, zoom_box(pn, ref, new))
         panels.append(pn)
@@ -236,9 +260,9 @@ def plot(args):
     info = json.loads((d / "info.json").read_text())
     data = {pid: np.load(d / f"{pid}.npz") for pid in info["patients"]}
     for view in ("axial", "coronal"):
-        draw(view, info, data, d / f"qualitative_{view}")
+        draw(view, info, data, d / f"qualitative_{view}", slice_by=args.slice)
         if info.get("ref") in info["labels"]:
-            draw(view, info, data, d / f"qualitative_{view}_zoom", zoom=True)
+            draw(view, info, data, d / f"qualitative_{view}_zoom", zoom=True, slice_by=args.slice)
 
 
 def main():
@@ -254,6 +278,8 @@ def main():
     e.set_defaults(func=export)
     q = sub.add_parser("plot")
     q.add_argument("--dir", default="outputs/hinh_dinh_tinh")
+    q.add_argument("--slice", choices=["middle", "gain"], default="middle",
+                   help="middle: lát giữa theo mask; gain: lát --new cải thiện nhiều nhất so với --ref (bỏ 15%% mỗi đầu)")
     q.set_defaults(func=plot)
     args = p.parse_args()
     if args.cmd == "export":
