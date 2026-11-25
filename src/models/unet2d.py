@@ -85,13 +85,18 @@ from ..data.preprocess import CT_CLIP
 MIXTURE_INIT_HU = (-1000.0, 40.0, 700.0)  # khí, mô mềm, xương
 
 
+def gn_groups(channels: int, max_groups: int = 32) -> int:
+    """Số nhóm GroupNorm: ước lớn nhất của channels không vượt max_groups (bội của 32 -> đúng 32 nhóm như cũ)."""
+    return next(g for g in range(min(max_groups, channels), 0, -1) if channels % g == 0)
+
+
 def make_norm(kind: str, channels: int) -> nn.Module:
     if kind == "batch":
         return nn.BatchNorm2d(channels)
     if kind == "instance":
         return nn.InstanceNorm2d(channels, affine=True)
     if kind == "group":
-        return nn.GroupNorm(min(32, channels), channels)
+        return nn.GroupNorm(gn_groups(channels), channels)
     if kind == "region_group":
         return RegionFiLMGroupNorm(channels)
     raise ValueError(f"norm '{kind}' không có, chọn batch | instance | group")

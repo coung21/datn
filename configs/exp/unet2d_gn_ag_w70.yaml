@@ -1,0 +1,9 @@
+# Đối chứng dung lượng cho unet2d_gn_ag_mvp (TPP, 34.97M tham số): UNet 2.5D + GN + AG mở rộng kênh 64 -> 70
+# (70 -> 140 -> 280 -> 560 -> 1120), ~37.5M tham số, nhiều hơn TPP vài triệu. Không có nhánh multi-view.
+# GroupNorm dùng ước lớn nhất <= 32 của số kênh (14 / 28 / 28 / 28 / 32 nhóm). So với unet2d_gn_ag (69.26) và
+# unet2d_gn_ag_mvp (67.77), seed 42.
+run_name: unet2d_gn_ag_w70
+model:
+  norm: group
+  attention_gates: true
+  base_channels: 70
