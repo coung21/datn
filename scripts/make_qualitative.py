@@ -255,9 +255,10 @@ def draw(view: str, info: dict, data: dict, out_stem: Path, zoom: bool = False, 
     print(f"Đã ghi {out_stem}.png / .pdf")
 
 
-def draw_boxed(view: str, info: dict, data: dict, out_stem: Path, slice_by: str = "middle") -> None:
+def draw_boxed(view: str, info: dict, data: dict, out_stem: Path, slice_by: str = "middle", compact: bool = False) -> None:
     """Mỗi bệnh nhân 4 hàng: lát đầy đủ có khung đỏ quanh vùng info["new"] cải thiện nhiều nhất so với ref,
-    rồi phóng to vùng đó: ảnh, sai số sCT − CT, hiệu sai số |e| − |e ref|."""
+    rồi phóng to vùng đó: ảnh, sai số sCT − CT, hiệu sai số |e| − |e ref|.
+    compact=True: 2 hàng, lát đầy đủ có khung và hàng phóng to (MRI, CT, rồi sai số sCT − CT của từng mô hình)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -275,20 +276,27 @@ def draw_boxed(view: str, info: dict, data: dict, out_stem: Path, slice_by: str 
         h, w = full["mask"].shape
         zh, zw = zoom["mask"].shape
         rows.append((full, box, zoom))
-        ratios += [h * full["aspect"] / w] + [zh * zoom["aspect"] / zw] * 3
+        ratios += [h * full["aspect"] / w] + [zh * zoom["aspect"] / zw] * (1 if compact else 3)
 
     col_w = 2.0
     fig, axes = plt.subplots(len(ratios), n_col, figsize=(col_w * n_col + 0.7, col_w * sum(ratios) + 0.5),
                              gridspec_kw={"height_ratios": ratios, "wspace": 0.03, "hspace": 0.05}, squeeze=False)
     fig.patch.set_facecolor("black")
     im_ct = im_err = im_diff = None
+    per = 2 if compact else 4
     for r, (full, box, zoom) in enumerate(rows):
-        a_full, a_img, a_err, a_diff = axes[4 * r: 4 * r + 4]
+        if compact:
+            a_full, a_err = axes[per * r: per * r + per]
+            a_img = a_diff = None
+        else:
+            a_full, a_img, a_err, a_diff = axes[per * r: per * r + per]
         (y, x) = box
-        for row, pn in ((a_full, full), (a_img, zoom)):
+        for row, pn in ((a_full, full), (a_img if a_img is not None else a_err, zoom)):
             kw = {"aspect": pn["aspect"], "interpolation": "nearest"}
             row[0].imshow(pn["mr"], cmap="gray", vmin=-1, vmax=1, **kw)
             im_ct = row[1].imshow(pn["ct"], cmap="gray", vmin=CT_WINDOW[0], vmax=CT_WINDOW[1], **kw)
+            if row is a_err:
+                continue
             for c, sct in enumerate(pn["sct"]):
                 row[2 + c].imshow(sct, cmap="gray", vmin=CT_WINDOW[0], vmax=CT_WINDOW[1], **kw)
         for ax in a_full:
@@ -305,6 +313,8 @@ def draw_boxed(view: str, info: dict, data: dict, out_stem: Path, slice_by: str 
             a_err[2 + c].text(0.5, 0.02, f"{np.nanmean(np.abs(err)):.1f} HU", color="black", fontsize=7,
                               ha="center", va="bottom", transform=a_err[2 + c].transAxes,
                               bbox={"facecolor": "white", "alpha": 0.8, "pad": 1.5, "edgecolor": "none"})
+            if a_diff is None:
+                continue
             if c == ref:
                 a_diff[2 + c].text(0.5, 0.5, "ref", color="white", fontsize=9, ha="center", va="center",
                                    transform=a_diff[2 + c].transAxes)
@@ -312,8 +322,10 @@ def draw_boxed(view: str, info: dict, data: dict, out_stem: Path, slice_by: str 
                 diff = np.where(zoom["mask"], np.abs(sct - zoom["ct"]) - err_ref, np.nan)
                 im_diff = a_diff[2 + c].imshow(diff, cmap="RdBu_r", vmin=-DIFF_LIMIT, vmax=DIFF_LIMIT, **kw)
         side = f"{ZOOM_MM:.0f} mm"
-        for ax, text in ((a_full[0], f"{full['pid']}\n{info['patients'][full['pid']]}"),
-                         (a_img[0], f"zoom {side}"), (a_err[0], "sCT − CT"), (a_diff[0], f"|e| − |e {info['ref']}|")):
+        notes = [(a_full[0], f"{full['pid']}\n{info['patients'][full['pid']]}")]
+        notes += [(a_err[0], f"zoom {side}")] if compact else [
+            (a_img[0], f"zoom {side}"), (a_err[0], "sCT − CT"), (a_diff[0], f"|e| − |e {info['ref']}|")]
+        for ax, text in notes:
             ax.text(0.03, 0.95, text, color="white", fontsize=8, ha="left", va="top", transform=ax.transAxes,
                     bbox={"facecolor": "black", "alpha": 0.6, "pad": 1.5, "edgecolor": "none"})
         if r == 0:
@@ -324,7 +336,7 @@ def draw_boxed(view: str, info: dict, data: dict, out_stem: Path, slice_by: str 
         ax.set_facecolor("black")
         for sp in ax.spines.values():
             sp.set_visible(False)
-    bars = [(im_ct, "HU"), (im_err, "sCT − CT (HU)"), (im_diff, "|e| − |e ref| (HU)")]
+    bars = [(im_ct, "HU"), (im_err, "sCT − CT (HU)")] + ([] if compact else [(im_diff, "|e| − |e ref| (HU)")])
     step = 0.9 / len(bars)
     for k, (im, label) in enumerate(bars):
         cax = fig.add_axes([0.925, 0.96 - step * (k + 1) + 0.04, 0.012, step - 0.08])
@@ -347,6 +359,7 @@ def plot(args):
         if info.get("ref") in info["labels"]:
             draw(view, info, data, d / f"qualitative_{view}_zoom", zoom=True, slice_by=args.slice)
             draw_boxed(view, info, data, d / f"qualitative_{view}_boxed", slice_by=args.slice)
+            draw_boxed(view, info, data, d / f"qualitative_{view}_compact", slice_by=args.slice, compact=True)
 
 
 def main():
