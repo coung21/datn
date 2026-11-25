@@ -51,6 +51,11 @@ def select_patients(ref: pd.DataFrame, new: pd.DataFrame) -> dict[str, str]:
     return picked
 
 
+def parse_region(pid: str) -> str:
+    """'1BA125' -> 'brain', '1PA021' -> 'pelvis' (ký tự thứ 2 của ID SynthRAD)."""
+    return "brain" if pid[1] == "B" else "pelvis"
+
+
 def middle_index(mask: np.ndarray, axis: int) -> int:
     """Chỉ số giữa của phần có mask theo trục axis."""
     other = tuple(a for a in range(mask.ndim) if a != axis)
@@ -115,7 +120,10 @@ DIFF_LIMIT = 100          # HU, thang bản đồ hiệu sai số |e_mô hình| 
 ZOOM_MM = 80              # cạnh vùng phóng to (mm)
 
 
-def gain_index(d, axis: int, ref: int, new: int, trim: float = 0.15, smooth: int = 7) -> int:
+HEAD_FROM = 0.45  # ca não, axial: chỉ xét từ 45% số lát tính từ dưới lên (bỏ vùng cổ, giữ đầu và hộp sọ)
+
+
+def gain_index(d, axis: int, ref: int, new: int, trim: float = 0.15, smooth: int = 7, low_from: float = 0.0) -> int:
     """Lát theo trục axis mà --new giảm MAE nhiều nhất so với --ref (trung bình trượt `smooth` lát),
     chỉ xét lát có diện tích mask >= 50% lớn nhất và bỏ `trim` mỗi đầu (lát biên thiếu ngữ cảnh)."""
     from scipy.ndimage import uniform_filter1d
@@ -129,7 +137,7 @@ def gain_index(d, axis: int, ref: int, new: int, trim: float = 0.15, smooth: int
     idx = np.flatnonzero(area > 0)
     k = int(trim * len(idx))
     ok = area >= 0.5 * area.max()
-    ok[:idx[0] + k] = False
+    ok[:idx[0] + max(k, int(low_from * len(idx)))] = False
     ok[idx[-1] - k + 1:] = False
     return int(np.argmax(np.where(ok, g, -np.inf)))
 
@@ -189,7 +197,8 @@ def draw(view: str, info: dict, data: dict, out_stem: Path, zoom: bool = False, 
     for pid in pids:
         index = None
         if slice_by == "gain" and ref is not None:
-            index = gain_index(data[pid], 0 if view == "axial" else 1, ref, new)
+            head = HEAD_FROM if view == "axial" and parse_region(pid) == "brain" else 0.0
+            index = gain_index(data[pid], 0 if view == "axial" else 1, ref, new, low_from=head)
             print(f"{pid} {view}: lát {index}")
         pn = slice_panel(view, pid, data[pid], len(labels), index)
         if zoom:
@@ -269,7 +278,8 @@ def draw_boxed(view: str, info: dict, data: dict, out_stem: Path, slice_by: str 
     n_col = 2 + len(labels)
     rows, ratios = [], []
     for pid in pids:
-        index = gain_index(data[pid], 0 if view == "axial" else 1, ref, new) if slice_by == "gain" else None
+        head = HEAD_FROM if view == "axial" and parse_region(pid) == "brain" else 0.0
+        index = gain_index(data[pid], 0 if view == "axial" else 1, ref, new, low_from=head) if slice_by == "gain" else None
         full = slice_panel(view, pid, data[pid], len(labels), index)
         box = zoom_box(full, ref, new)
         zoom = crop_panel(full, box)
